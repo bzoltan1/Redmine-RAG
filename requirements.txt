@@ -1,0 +1,15 @@
+# Redmine API
+requests>=2.31
+python-dotenv>=1.0
+
+# Vector store
+chromadb>=0.5
+
+# Embeddings and LLM
+ollama>=0.2
+
+# Testing
+pytest>=8.0
+pytest-mock>=3.14
+responses>=0.25
+pytest-cov>=5.0

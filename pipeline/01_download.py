@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """
-pipeline/01_download.py — Download all Redmine issues with journals.
+pipeline/01_download.py — Download Redmine issues with journals.
 
-Flow for each configured project:
-  1. Load checkpoint (resume if interrupted).
-  2. Paginate through all issues with include=journals.
-  3. For any issue returned without journals, re-fetch individually.
-  4. Save checkpoint every SAVE_INTERVAL issues.
-  5. Write <RAW_DIR>/<project_id>.json.
-Merge all per-project files into MASTER_FILE when done.
+Modes
+-----
+Full download (default)
+    Downloads every issue for every configured project from scratch.
+    Resumes automatically if interrupted.
 
-Flags:
-  --dev   Use dev-mode config (single small project, isolated data/dev/ dir).
+Incremental sync (--since DATE or --sync)
+    Fetches only issues updated on or after DATE, merges them into the
+    existing master dataset, and updates the sync state.
+
+    --since 2025-12-02          fetch issues updated >= that date
+    --sync                      use the date recorded by the last --since/--sync run
+
+    Use --sync for regular scheduled runs. Use --since for the first incremental
+    run after migrating an existing dataset.
+
+Flags
+-----
+--dev       Use dev-mode config (qesecurity project, data/dev/).
+--since     ISO-8601 date for incremental sync (e.g. 2025-12-02).
+--sync      Shorthand for --since <last_synced_at> from sync state file.
 
 Timing summary is printed at the end.
 Configuration comes from .env via config.py.
@@ -22,6 +33,7 @@ import json
 import sys
 import time
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -37,6 +49,10 @@ log = logging.getLogger(__name__)
 
 SEPARATOR = "=" * 70
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def progress(msg: str) -> None:
     """Print a progress line immediately, bypassing any buffering."""
@@ -66,11 +82,46 @@ def save_project_data(c: PipelineConfig, project_id: str, issues: list[dict]) ->
         json.dump(issues, fh, ensure_ascii=False, indent=2)
 
 
-def download_project(
+def merge_into(existing: dict[int, dict], incoming: list[dict]) -> tuple[int, int]:
+    """
+    Merge *incoming* issues into the *existing* id→issue map in place.
+
+    Returns (n_new, n_updated) counts.
+    """
+    n_new = n_updated = 0
+    for issue in incoming:
+        iid = issue["id"]
+        if iid in existing:
+            n_updated += 1
+        else:
+            n_new += 1
+        existing[iid] = issue
+    return n_new, n_updated
+
+
+def load_master(c: PipelineConfig) -> dict[int, dict]:
+    """Load the master file into an id→issue map."""
+    if c.MASTER_FILE.exists():
+        with c.MASTER_FILE.open("r", encoding="utf-8") as fh:
+            return {i["id"]: i for i in json.load(fh)}
+    return {}
+
+
+def save_master(c: PipelineConfig, issues_map: dict[int, dict]) -> None:
+    c.MASTER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with c.MASTER_FILE.open("w", encoding="utf-8") as fh:
+        json.dump(list(issues_map.values()), fh, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Download modes
+# ---------------------------------------------------------------------------
+
+def download_project_full(
     client: RedmineClient, c: PipelineConfig, project_id: str
 ) -> tuple[list[dict], float]:
-    """Download all issues for *project_id*. Returns (issues, elapsed_seconds)."""
-    t_project_start = time.perf_counter()
+    """Full download of all issues for *project_id*. Returns (issues, elapsed)."""
+    t_start = time.perf_counter()
     cp_path = checkpoint_file(c, project_id)
     cp = ckpt.load(cp_path)
 
@@ -82,15 +133,15 @@ def download_project(
     }
 
     if offset > 0 and offset == total:
-        progress(f"  Bulk download '{project_id}': already complete ({offset}/{total} issues), skipping.")
+        progress(f"  Bulk '{project_id}': already complete ({offset}/{total}), skipping.")
     elif offset > 0:
-        progress(f"  Resuming '{project_id}' bulk download from issue {offset}/{total} ...")
+        progress(f"  Resuming '{project_id}' from offset {offset}/{total} ...")
 
     # ---- Paginated bulk download ----
-    t_bulk_start = time.perf_counter()
+    t_bulk = time.perf_counter()
     try:
         while total is None or offset < total:
-            progress(f"  [{project_id}] Bulk: fetching issues {offset+1}–{offset+100} ...")
+            progress(f"  [{project_id}] Bulk: fetching issues {offset+1}–{min(offset+100, total or offset+100)} ...")
             page_issues, page_total = client.fetch_issues_page(
                 project_id, offset=offset, limit=100
             )
@@ -105,17 +156,17 @@ def download_project(
                 successful_ids.add(issue["id"])
 
             offset += len(page_issues)
-            cp = {"offset": offset, "total": total,
-                  "successful_ids": list(successful_ids), "failed_ids": {}}
-            ckpt.save(cp_path, cp)
+            ckpt.save(cp_path, {
+                "offset": offset, "total": total,
+                "successful_ids": list(successful_ids), "failed_ids": {},
+            })
             save_project_data(c, project_id, list(issues_map.values()))
 
-            elapsed = time.perf_counter() - t_bulk_start
+            elapsed = time.perf_counter() - t_bulk
             rate = offset / elapsed if elapsed > 0 else 0
-            pct = 100 * offset / total if total else 0
             eta = (total - offset) / rate if rate > 0 else 0
             progress(
-                f"  [{project_id}] Bulk: {offset}/{total} ({pct:.0f}%)  "
+                f"  [{project_id}] Bulk: {offset}/{total} ({100*offset/total:.0f}%)  "
                 f"{rate:.0f} issues/s  ETA {format_duration(eta)}"
             )
             time.sleep(c.RATE_LIMIT_SECONDS)
@@ -123,55 +174,136 @@ def download_project(
     except Exception as exc:
         progress(f"  ERROR during bulk download for '{project_id}': {exc}")
 
-    t_bulk = time.perf_counter() - t_bulk_start
-    if t_bulk > 0.1:
-        progress(f"  [{project_id}] Bulk download done in {format_duration(t_bulk)}")
-
     # ---- Per-issue re-fetch for missing journals ----
-    missing_journals = [i for i in issues_map.values() if not i.get("journals")]
-    t_journal = 0.0
-    if missing_journals:
-        n_missing = len(missing_journals)
-        eta_estimate = format_duration(n_missing * c.RATE_LIMIT_SECONDS)
+    missing = [i for i in issues_map.values() if not i.get("journals")]
+    if missing:
+        n = len(missing)
         progress(
-            f"\n  [{project_id}] Journal re-fetch: {n_missing} issues need journals "
-            f"(ETA ~{eta_estimate} at {c.RATE_LIMIT_SECONDS}s/issue)"
+            f"\n  [{project_id}] Journal re-fetch: {n} issues need journals "
+            f"(ETA ~{format_duration(n * c.RATE_LIMIT_SECONDS)} at {c.RATE_LIMIT_SECONDS}s/issue)"
         )
-        t_j_start = time.perf_counter()
-        for i, issue in enumerate(missing_journals, 1):
+        t_j = time.perf_counter()
+        for i, issue in enumerate(missing, 1):
             enriched = client.fetch_issue(issue["id"])
             if enriched is not ISSUE_NOT_FOUND and isinstance(enriched, dict):
                 enriched["project_identifier"] = project_id
                 issues_map[enriched["id"]] = enriched
             if i % c.SAVE_INTERVAL == 0:
                 save_project_data(c, project_id, list(issues_map.values()))
-            elapsed_j = time.perf_counter() - t_j_start
+            elapsed_j = time.perf_counter() - t_j
             rate_j = i / elapsed_j if elapsed_j > 0 else 0
-            eta = (n_missing - i) / rate_j if rate_j > 0 else 0
+            eta_j = (n - i) / rate_j if rate_j > 0 else 0
             progress(
-                f"  [{project_id}] Journals: {i}/{n_missing} ({100*i/n_missing:.0f}%)  "
-                f"{rate_j:.1f} issues/s  ETA {format_duration(eta)}"
+                f"  [{project_id}] Journals: {i}/{n} ({100*i/n:.0f}%)  "
+                f"{rate_j:.1f} issues/s  ETA {format_duration(eta_j)}"
             )
             time.sleep(c.RATE_LIMIT_SECONDS)
-        t_journal = time.perf_counter() - t_j_start
 
-        journals_found = sum(1 for i in issues_map.values() if i.get("journals"))
+        with_journals = sum(1 for i in issues_map.values() if i.get("journals"))
         progress(
-            f"  [{project_id}] Journal coverage: {journals_found}/{len(issues_map)} "
-            f"({100*journals_found/len(issues_map):.0f}%)"
+            f"  [{project_id}] Journal coverage: {with_journals}/{len(issues_map)} "
+            f"({100*with_journals/len(issues_map):.0f}%)"
         )
 
     all_issues = list(issues_map.values())
     save_project_data(c, project_id, all_issues)
     ckpt.delete(cp_path)
 
-    t_project = time.perf_counter() - t_project_start
-    log.info(
-        "  Done: %d issues for '%s' in %s",
-        len(all_issues), project_id, format_duration(t_project),
-    )
-    return all_issues, t_project
+    elapsed = time.perf_counter() - t_start
+    progress(f"  [{project_id}] Done: {len(all_issues)} issues in {format_duration(elapsed)}")
+    return all_issues, elapsed
 
+
+def sync_project(
+    client: RedmineClient, c: PipelineConfig, project_id: str, since: str
+) -> tuple[int, int, float]:
+    """
+    Incremental sync: fetch issues updated >= *since* and merge into the
+    existing per-project file.
+
+    Returns (n_new, n_updated, elapsed_seconds).
+    """
+    t_start = time.perf_counter()
+    issues_map: dict[int, dict] = {
+        i["id"]: i for i in load_project_data(c, project_id)
+    }
+    existing_count = len(issues_map)
+
+    offset = 0
+    total: int | None = None
+    all_incoming: list[dict] = []
+
+    progress(f"  [{project_id}] Syncing issues updated >= {since} ...")
+
+    try:
+        while total is None or offset < total:
+            page_issues, page_total = client.fetch_updated_since(
+                project_id, since=since, offset=offset, limit=100
+            )
+            if total is None:
+                total = page_total
+                if total == 0:
+                    progress(f"  [{project_id}] No updates since {since}.")
+                    break
+                progress(f"  [{project_id}] {total} issues to sync.")
+            if not page_issues:
+                break
+
+            all_incoming.extend(page_issues)
+            offset += len(page_issues)
+
+            elapsed = time.perf_counter() - t_start
+            rate = offset / elapsed if elapsed > 0 else 0
+            eta = (total - offset) / rate if rate > 0 else 0
+            progress(
+                f"  [{project_id}] Fetched: {offset}/{total} ({100*offset/total:.0f}%)  "
+                f"{rate:.0f} issues/s  ETA {format_duration(eta)}"
+            )
+            time.sleep(c.RATE_LIMIT_SECONDS)
+
+    except Exception as exc:
+        progress(f"  ERROR syncing '{project_id}': {exc}")
+
+    # ---- Per-issue re-fetch for missing journals in incoming issues ----
+    # The bulk updated_on fetch includes journals, but some may be missing.
+    missing = [i for i in all_incoming if not i.get("journals")]
+    if missing:
+        n = len(missing)
+        progress(f"  [{project_id}] Journal re-fetch for {n} incoming issues ...")
+        t_j = time.perf_counter()
+        for idx, issue in enumerate(missing, 1):
+            enriched = client.fetch_issue(issue["id"])
+            if enriched is not ISSUE_NOT_FOUND and isinstance(enriched, dict):
+                enriched["project_identifier"] = project_id
+                # replace in all_incoming list
+                for i, item in enumerate(all_incoming):
+                    if item["id"] == enriched["id"]:
+                        all_incoming[i] = enriched
+                        break
+            elapsed_j = time.perf_counter() - t_j
+            rate_j = idx / elapsed_j if elapsed_j > 0 else 0
+            eta_j = (n - idx) / rate_j if rate_j > 0 else 0
+            progress(
+                f"  [{project_id}] Journals: {idx}/{n} ({100*idx/n:.0f}%)  "
+                f"{rate_j:.1f} issues/s  ETA {format_duration(eta_j)}"
+            )
+            time.sleep(c.RATE_LIMIT_SECONDS)
+
+    n_new, n_updated = merge_into(issues_map, all_incoming)
+    save_project_data(c, project_id, list(issues_map.values()))
+
+    elapsed = time.perf_counter() - t_start
+    progress(
+        f"  [{project_id}] Sync done in {format_duration(elapsed)}: "
+        f"+{n_new} new, {n_updated} updated  "
+        f"(total {len(issues_map)} issues)"
+    )
+    return n_new, n_updated, elapsed
+
+
+# ---------------------------------------------------------------------------
+# Merge all per-project files into master
+# ---------------------------------------------------------------------------
 
 def merge_projects(c: PipelineConfig) -> list[dict]:
     master: list[dict] = []
@@ -183,27 +315,86 @@ def merge_projects(c: PipelineConfig) -> list[dict]:
     return master
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Download Redmine issues")
+    parser = argparse.ArgumentParser(
+        description="Download Redmine issues (full or incremental sync)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # First-time full download
+  python pipeline/01_download.py
+
+  # First incremental sync after migrating an existing dataset
+  python pipeline/01_download.py --since 2025-12-02
+
+  # Regular scheduled sync (uses date from last run automatically)
+  python pipeline/01_download.py --sync
+
+  # Dev mode incremental sync
+  python pipeline/01_download.py --dev --sync
+""",
+    )
     parser.add_argument(
         "--dev", action="store_true",
+        help=f"Dev mode: use project '{cfg.DEV_PROJECT_ID}' and {cfg.DEV_DATA_DIR}.",
+    )
+    parser.add_argument(
+        "--since", metavar="DATE",
         help=(
-            f"Dev mode: download only project '{cfg.DEV_PROJECT_ID}' "
-            f"into {cfg.DEV_DATA_DIR}. Does not touch production data."
+            "Incremental sync: fetch only issues updated on or after DATE "
+            "(ISO-8601, e.g. 2025-12-02). Merges into existing data."
+        ),
+    )
+    parser.add_argument(
+        "--sync", action="store_true",
+        help=(
+            "Incremental sync using the date from the last successful sync. "
+            "Equivalent to --since <last_synced_at>. "
+            "Fails with an error if no previous sync state exists."
         ),
     )
     args = parser.parse_args()
     c = cfg.dev() if args.dev else cfg.prod()
 
+    # Resolve sync date
+    since: str | None = None
+    if args.sync and args.since:
+        parser.error("--sync and --since are mutually exclusive.")
+
+    if args.sync:
+        # Find the earliest last_synced_at across all projects (most conservative)
+        states = [
+            ckpt.get_last_synced_at(c.RAW_DIR, pid)
+            for pid in c.PROJECT_IDS
+        ]
+        valid = [s for s in states if s]
+        if not valid:
+            parser.error(
+                "--sync requires a previous sync state. "
+                "Run with --since DATE first."
+            )
+        since = min(valid)  # earliest across projects = safest overlap point
+
+    elif args.since:
+        since = args.since
+
+    mode = f"INCREMENTAL (since {since})" if since else "FULL DOWNLOAD"
+
     print(f"\n{SEPARATOR}")
-    print(f"Redmine Issue Downloader  [{c.label()}]")
+    print(f"Redmine Issue Downloader  [{c.label()}]  [{mode}]")
     if c.is_dev:
         print(f"  Project  : {c.PROJECT_IDS}")
         print(f"  Data dir : {c.DATA_DIR}")
+    if since:
+        print(f"  Since    : {since}")
     print(f"{SEPARATOR}\n")
 
     if not c.REDMINE_API_KEY:
-        log.error("REDMINE_API_KEY is not set. Check your .env file.")
+        progress("ERROR: REDMINE_API_KEY is not set. Check your .env file.")
         sys.exit(1)
 
     c.RAW_DIR.mkdir(parents=True, exist_ok=True)
@@ -216,28 +407,52 @@ def main() -> None:
         max_retries=c.MAX_RETRIES,
     )
 
-    report = PipelineReport(f"Download [{c.label()}]")
-    total_issues = 0
+    report = PipelineReport(f"Download [{c.label()}] [{mode}]")
+    total_new = total_updated = total_issues = 0
 
-    for pid in c.PROJECT_IDS:
-        progress(f"\n--- Project: {pid} ---")
-        issues, elapsed = download_project(client, c, pid)
-        total_issues += len(issues)
-        report.record(f"Project '{pid}'", elapsed)
+    # Record sync start time before any API calls (conservative: if we started
+    # at T, next --sync will use T, so no gap can form between runs)
+    sync_started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    progress(f"\nTotal issues downloaded: {total_issues}")
+    if since:
+        # ---- Incremental sync ----
+        for pid in c.PROJECT_IDS:
+            progress(f"\n--- Project: {pid} (sync) ---")
+            n_new, n_updated, elapsed = sync_project(client, c, pid, since)
+            total_new += n_new
+            total_updated += n_updated
+            report.record(f"Sync '{pid}'", elapsed)
+            # Save sync state per project
+            ckpt.save_sync_state(c.RAW_DIR, pid, sync_started_at)
 
+        progress(
+            f"\nSync complete: +{total_new} new, {total_updated} updated "
+            f"across {len(c.PROJECT_IDS)} project(s)"
+        )
+
+    else:
+        # ---- Full download ----
+        for pid in c.PROJECT_IDS:
+            progress(f"\n--- Project: {pid} ---")
+            issues, elapsed = download_project_full(client, c, pid)
+            total_issues += len(issues)
+            report.record(f"Project '{pid}'", elapsed)
+            ckpt.save_sync_state(c.RAW_DIR, pid, sync_started_at)
+
+        progress(f"\nTotal issues downloaded: {total_issues}")
+
+    # ---- Merge all per-project files into master ----
     progress("Merging all projects into master file ...")
     with StageTimer("Merge projects") as t_merge:
         master = merge_projects(c)
-        c.MASTER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with c.MASTER_FILE.open("w", encoding="utf-8") as fh:
-            json.dump(master, fh, ensure_ascii=False, indent=2)
+        save_master(c, {i["id"]: i for i in master})
     report.record("Merge projects", t_merge.elapsed)
-
     progress(f"Merged {len(master)} issues → {c.MASTER_FILE}")
+
     report.print()
-    print(f"\nNext step: python pipeline/02_anonymize.py{'  --dev' if c.is_dev else ''}")
+    next_flag = " --dev" if c.is_dev else ""
+    print(f"\nNext step: python pipeline/02_anonymize.py{next_flag}")
+    print(f"Future syncs: python pipeline/01_download.py{next_flag} --sync")
 
 
 if __name__ == "__main__":

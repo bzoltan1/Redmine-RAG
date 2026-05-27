@@ -117,6 +117,53 @@ class RedmineClient:
             issue["project_identifier"] = project_id
         return issues, data.get("total_count", 0)
 
+    def fetch_updated_since(
+        self,
+        project_id: str,
+        since: str,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """
+        Fetch issues in *project_id* that were updated on or after *since*.
+
+        Parameters
+        ----------
+        project_id: Redmine project identifier.
+        since:      ISO-8601 date or datetime string, e.g. "2025-12-02" or
+                    "2025-12-02T00:00:00Z". Passed directly to Redmine's
+                    ``updated_on`` filter as ``>=SINCE``.
+        offset:     Pagination offset.
+        limit:      Page size (max 100).
+
+        Returns
+        -------
+        (issues, total_count) — same shape as fetch_issues_page().
+
+        Notes
+        -----
+        Using ``updated_on >= SINCE`` captures both:
+        - New issues created after *since* (they are also updated after *since*)
+        - Existing issues that received new journal entries after *since*
+        This single filter is sufficient for a complete incremental sync.
+        """
+        data = self._get(
+            f"{self.base_url}/issues.json",
+            params={
+                "project_id": project_id,
+                "updated_on": f">={since}",
+                "limit": limit,
+                "offset": offset,
+                "include": "journals",
+                "status_id": "*",
+                "sort": "updated_on:asc",
+            },
+        )
+        issues = data.get("issues", [])
+        for issue in issues:
+            issue["project_identifier"] = project_id
+        return issues, data.get("total_count", 0)
+
     def fetch_issue(self, issue_id: int) -> dict[str, Any] | object:
         """
         Fetch a single issue with full journal/watcher data.

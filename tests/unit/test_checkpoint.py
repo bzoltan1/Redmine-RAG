@@ -116,3 +116,67 @@ class TestDelete:
 
     def test_no_error_when_file_missing(self, tmp_path):
         delete(tmp_path / "ghost.json")  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# Sync state
+# ---------------------------------------------------------------------------
+
+from core.checkpoint import (
+    save_sync_state, load_sync_state, get_last_synced_at, sync_state_path
+)
+
+
+class TestSyncState:
+    def test_load_returns_none_when_no_file(self, tmp_path):
+        state = load_sync_state(tmp_path, "myproject")
+        assert state["last_synced_at"] is None
+        assert state["sync_count"] == 0
+
+    def test_save_and_load_roundtrip(self, tmp_path):
+        save_sync_state(tmp_path, "myproject", "2025-12-02T00:00:00Z")
+        state = load_sync_state(tmp_path, "myproject")
+        assert state["last_synced_at"] == "2025-12-02T00:00:00Z"
+
+    def test_sync_count_increments(self, tmp_path):
+        save_sync_state(tmp_path, "proj", "2025-01-01T00:00:00Z")
+        save_sync_state(tmp_path, "proj", "2025-06-01T00:00:00Z")
+        state = load_sync_state(tmp_path, "proj")
+        assert state["sync_count"] == 2
+
+    def test_latest_date_overwrites_previous(self, tmp_path):
+        save_sync_state(tmp_path, "proj", "2025-01-01T00:00:00Z")
+        save_sync_state(tmp_path, "proj", "2025-12-01T00:00:00Z")
+        assert get_last_synced_at(tmp_path, "proj") == "2025-12-01T00:00:00Z"
+
+    def test_get_last_synced_at_none_when_missing(self, tmp_path):
+        assert get_last_synced_at(tmp_path, "ghost") is None
+
+    def test_get_last_synced_at_returns_string(self, tmp_path):
+        save_sync_state(tmp_path, "proj", "2026-01-15T12:00:00Z")
+        result = get_last_synced_at(tmp_path, "proj")
+        assert isinstance(result, str)
+        assert result == "2026-01-15T12:00:00Z"
+
+    def test_defaults_to_now_when_no_date_given(self, tmp_path):
+        save_sync_state(tmp_path, "proj")
+        result = get_last_synced_at(tmp_path, "proj")
+        assert result is not None
+        assert "T" in result  # ISO-8601 format
+
+    def test_different_projects_isolated(self, tmp_path):
+        save_sync_state(tmp_path, "proj_a", "2025-01-01T00:00:00Z")
+        save_sync_state(tmp_path, "proj_b", "2025-06-01T00:00:00Z")
+        assert get_last_synced_at(tmp_path, "proj_a") == "2025-01-01T00:00:00Z"
+        assert get_last_synced_at(tmp_path, "proj_b") == "2025-06-01T00:00:00Z"
+
+    def test_state_file_path(self, tmp_path):
+        path = sync_state_path(tmp_path, "qesecurity")
+        assert path.name == "qesecurity_sync.json"
+        assert path.parent == tmp_path
+
+    def test_corrupt_file_returns_defaults(self, tmp_path):
+        path = sync_state_path(tmp_path, "proj")
+        path.write_text("not valid json")
+        state = load_sync_state(tmp_path, "proj")
+        assert state["last_synced_at"] is None

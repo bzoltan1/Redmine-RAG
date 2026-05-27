@@ -238,3 +238,63 @@ class TestAdaptiveBackoff:
         client = make_client(max_retries=2, rate_limit=0.0)
         client.fetch_issue(8)
         assert client._current_delay == 0.0
+
+
+# ---------------------------------------------------------------------------
+# fetch_updated_since (incremental sync)
+# ---------------------------------------------------------------------------
+
+class TestFetchUpdatedSince:
+    @rsps_lib.activate
+    def test_returns_issues_and_total(self):
+        issues = [{"id": 10, "subject": "New issue", "updated_on": "2026-01-10T00:00:00Z"}]
+        rsps_lib.add(rsps_lib.GET, f"{BASE}/issues.json",
+                     json=issues_response(issues, 1))
+        client = make_client()
+        result, total = client.fetch_updated_since("proj", since="2025-12-02")
+        assert total == 1
+        assert len(result) == 1
+
+    @rsps_lib.activate
+    def test_updated_on_filter_in_request(self):
+        rsps_lib.add(rsps_lib.GET, f"{BASE}/issues.json",
+                     json=issues_response([], 0))
+        client = make_client()
+        client.fetch_updated_since("proj", since="2025-12-02")
+        url = rsps_lib.calls[0].request.url
+        assert "updated_on" in url
+        assert "2025-12-02" in url
+
+    @rsps_lib.activate
+    def test_project_identifier_injected(self):
+        issues = [{"id": 5, "subject": "Updated"}]
+        rsps_lib.add(rsps_lib.GET, f"{BASE}/issues.json",
+                     json=issues_response(issues, 1))
+        client = make_client()
+        result, _ = client.fetch_updated_since("my-proj", since="2025-12-02")
+        assert result[0]["project_identifier"] == "my-proj"
+
+    @rsps_lib.activate
+    def test_journals_included_in_params(self):
+        rsps_lib.add(rsps_lib.GET, f"{BASE}/issues.json",
+                     json=issues_response([], 0))
+        client = make_client()
+        client.fetch_updated_since("proj", since="2025-12-02")
+        assert "journals" in rsps_lib.calls[0].request.url
+
+    @rsps_lib.activate
+    def test_empty_result_when_no_updates(self):
+        rsps_lib.add(rsps_lib.GET, f"{BASE}/issues.json",
+                     json=issues_response([], 0))
+        client = make_client()
+        result, total = client.fetch_updated_since("proj", since="2099-01-01")
+        assert result == []
+        assert total == 0
+
+    @rsps_lib.activate
+    def test_offset_forwarded(self):
+        rsps_lib.add(rsps_lib.GET, f"{BASE}/issues.json",
+                     json=issues_response([], 0))
+        client = make_client()
+        client.fetch_updated_since("proj", since="2025-12-02", offset=100)
+        assert "offset=100" in rsps_lib.calls[0].request.url

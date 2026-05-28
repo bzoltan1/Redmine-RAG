@@ -183,11 +183,29 @@ def download_project_full(
             f"(ETA ~{format_duration(n * c.RATE_LIMIT_SECONDS)} at {c.RATE_LIMIT_SECONDS}s/issue)"
         )
         t_j = time.perf_counter()
+        network_errors = 0
         for i, issue in enumerate(missing, 1):
-            enriched = client.fetch_issue(issue["id"])
-            if enriched is not ISSUE_NOT_FOUND and isinstance(enriched, dict):
-                enriched["project_identifier"] = project_id
-                issues_map[enriched["id"]] = enriched
+            try:
+                enriched = client.fetch_issue(issue["id"])
+                if enriched is not ISSUE_NOT_FOUND and isinstance(enriched, dict):
+                    enriched["project_identifier"] = project_id
+                    issues_map[enriched["id"]] = enriched
+                network_errors = 0  # reset on success
+            except Exception as exc:
+                network_errors += 1
+                progress(
+                    f"  [{project_id}] Network error on issue #{issue['id']}: {exc}"
+                    f"  (skipping, will retry next run)"
+                )
+                save_project_data(c, project_id, list(issues_map.values()))
+                if network_errors >= 3:
+                    progress(
+                        f"  [{project_id}] {network_errors} consecutive errors — "
+                        f"pausing 30s before continuing..."
+                    )
+                    time.sleep(30)
+                    network_errors = 0
+                continue
             if i % c.SAVE_INTERVAL == 0:
                 save_project_data(c, project_id, list(issues_map.values()))
             elapsed_j = time.perf_counter() - t_j
@@ -271,15 +289,25 @@ def sync_project(
         n = len(missing)
         progress(f"  [{project_id}] Journal re-fetch for {n} incoming issues ...")
         t_j = time.perf_counter()
+        network_errors = 0
         for idx, issue in enumerate(missing, 1):
-            enriched = client.fetch_issue(issue["id"])
-            if enriched is not ISSUE_NOT_FOUND and isinstance(enriched, dict):
-                enriched["project_identifier"] = project_id
-                # replace in all_incoming list
-                for i, item in enumerate(all_incoming):
-                    if item["id"] == enriched["id"]:
-                        all_incoming[i] = enriched
-                        break
+            try:
+                enriched = client.fetch_issue(issue["id"])
+                if enriched is not ISSUE_NOT_FOUND and isinstance(enriched, dict):
+                    enriched["project_identifier"] = project_id
+                    for i, item in enumerate(all_incoming):
+                        if item["id"] == enriched["id"]:
+                            all_incoming[i] = enriched
+                            break
+                network_errors = 0
+            except Exception as exc:
+                network_errors += 1
+                progress(f"  [{project_id}] Network error on issue #{issue['id']}: {exc}  (skipping)")
+                if network_errors >= 3:
+                    progress(f"  [{project_id}] {network_errors} consecutive errors — pausing 30s...")
+                    time.sleep(30)
+                    network_errors = 0
+                continue
             elapsed_j = time.perf_counter() - t_j
             rate_j = idx / elapsed_j if elapsed_j > 0 else 0
             eta_j = (n - idx) / rate_j if rate_j > 0 else 0

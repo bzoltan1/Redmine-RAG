@@ -229,6 +229,35 @@ DEV_COLLECTION_NAME=redmine_issues_dev
 
 ---
 
+## openqatests project — data quality analysis
+
+Run on 2026-05-27 against the 13,247 issues downloaded so far.
+
+| Metric | openqatests | Other projects (avg) |
+|---|---|---|
+| Issues with journals | 20% | 90%+ |
+| Auto-generated template (`## Observation`) | 69% | 8–27% |
+| Journal text notes (vs field-change only) | 63% | 40–51% |
+| Avg journal entries / issue | 1.5 | ~5–7 |
+| Contains openQA URL links | 73% | rare |
+
+**Finding:** 69% of openqatests issues are auto-generated from a standard
+`## Observation / ## Reproducible / ## Expected result` template, populated
+automatically when an openQA test fails. They contain a link to the failing
+test run, a needle list, and a "fails since build X" statement. Most are
+resolved silently — no human comments explaining the root cause or fix.
+
+**The 20% with journals** contain genuine engineering discussion (the richest
+issue had 200k chars of autoinst log dumps, 60+ comment threads on hard
+boot failures, etc.). These are high signal. The 80% without journals are
+mostly auto-created failure tickets resolved by fixing the needle or the
+test, with no explanatory text.
+
+**Decision pending:** whether to continue downloading openqatests journals
+or exclude/filter the project. See interview section below.
+
+---
+
 ## What was not done / future work
 
 | Area | Notes |

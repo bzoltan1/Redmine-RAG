@@ -606,6 +606,179 @@ is invoked.
 
 ---
 
+### Phase 9 — Data quality analysis, incremental sync, and production run
+
+#### 9a — openqatests data quality investigation
+
+Before committing to downloading all 13,247 openqatests issues (which would
+take ~4 hours), a data quality analysis was performed on the partial dataset.
+
+**Findings:**
+
+| Metric | openqatests | Other projects (avg) |
+|---|---|---|
+| Auto-generated template (`## Observation`) | 69% | 8–27% |
+| Issues with journals (human discussion) | 20% | 90–100% |
+| Avg journal entries/issue | 1.5 | 5–7 |
+| Contains openQA URL links | 73% | rare |
+
+**Decision:** download openqatests but apply a journals-only filter — keep
+only the ~2,600 issues that have at least one human comment. This is
+controlled by `JOURNALS_ONLY_PROJECTS=openqatests` in `.env` and the
+`config.JOURNALS_ONLY_PROJECTS` set in `config.py`. The filter is applied
+at the end of `download_project_full()` after all journals are fetched.
+
+---
+
+#### 9b — Incremental sync (`--since` / `--sync`)
+
+**Problem:** the dataset needs regular updates as new Redmine issues are
+created and existing ones receive new comments. Re-downloading all 28k
+issues every time is not feasible.
+
+**Solution:** `pipeline/01_download.py` gains two new flags:
+
+```
+--since DATE   Fetch only issues with updated_on >= DATE.
+               Merges into existing per-project JSON files.
+--sync         Use the date from the last successful sync automatically.
+               Equivalent to --since <last_synced_at>.
+```
+
+Using `updated_on >= SINCE` captures both new issues (also have
+`updated_on >= SINCE`) and existing issues that received new comments —
+one filter covers everything needed for a complete incremental sync.
+
+**New in `core/checkpoint.py`:**
+- `save_sync_state(raw_dir, project_id, synced_at)` — records the timestamp
+  of each successful sync per project
+- `get_last_synced_at(raw_dir, project_id)` — reads it back for `--sync`
+
+**New in `core/redmine_client.py`:**
+- `fetch_updated_since(project_id, since, offset, limit)` — paginated fetch
+  with `updated_on >= SINCE` filter
+
+**New in `pipeline/01_download.py`:**
+- `merge_into(existing, incoming)` — merges new/updated issues into the
+  existing id→issue map; returns (n_new, n_updated) counts
+- `sync_project(client, c, project_id, since)` — full incremental sync
+  for one project
+
+**Sync state files:** `data/raw/<project_id>_sync.json` — written after
+each successful run with the timestamp of when the sync started (conservative:
+uses start time, not end time, to prevent gaps between consecutive runs).
+
+**11 new tests** in `test_checkpoint.py`, **6 new tests** in
+`test_redmine_client.py`, **6 new tests** in `test_download.py`.
+
+---
+
+#### 9c — Crash-resistant journal re-fetch
+
+**Problem:** the journal re-fetch loop crashed the entire pipeline on any
+network error (DNS failure, timeout), losing all progress for the current
+project.
+
+**Fix:** the journal loop now catches all `Exception` types per issue,
+logs the error, saves progress, and continues to the next issue. After 3
+consecutive failures it pauses for 30 seconds before continuing. This
+allows the download to survive transient network outages without losing work.
+
+---
+
+#### 9d — Upsert instead of add in ChromaDB
+
+**Problem:** `collection.add()` raises `DuplicateIDError` if the ingest is
+interrupted and restarted, making it impossible to resume without `--reset`
+(which discards all already-embedded chunks).
+
+**Fix:** `core/store.py` switched from `collection.add()` to
+`collection.upsert()`. Upsert inserts new documents and updates existing
+ones with no error on duplicates, making the ingest fully resumable at any
+point without data loss.
+
+---
+
+#### 9e — Full production download and first demo
+
+**Data collected (2026-05-29):**
+
+| Project | Issues | With journals | Journal entries |
+|---|---|---|---|
+| virtualization | 2,778 | ~2,700 | ~21,000 |
+| performance | 2,076 | ~1,950 | ~10,500 |
+| qesecurity | 765 | 748 | 4,969 |
+| qe-kernel | 1,867 | 1,858 | 13,241 |
+| qam | 561 | ~450 | ~2,700 |
+| qe-yast | 2,429 | 2,409 | 21,392 |
+| openqatests | 13,247 | 7,593 (filtered) | 57,150 |
+| openqa-infrastructure | downloading | — | — |
+| containers | downloading | — | — |
+
+**Master dataset (partial, demo):** 18,069 issues → 40,509 chunks
+
+**Demo:** successfully presented to a group of QA engineers using the
+partial collection (13,700 chunks, 4 projects). Queries demonstrated:
+- Semantic search finding s390x issues across projects
+- Automatic `status: Rejected` filter extraction from natural language
+- Cross-project synthesis of security vulnerability history
+- Engineering knowledge extraction from 276-comment Agama epic
+
+**Key hardware finding:** on CPU-only hardware, `nomic-embed-text` embeds
+at ~2.8 chunks/s (limited by the embedding model's matrix operations, not
+I/O). Ingesting 40,509 chunks takes ~4 hours. LLM generation (llama3) takes
+25–55 seconds per query. Both are fundamental hardware constraints with no
+software workaround beyond acquiring a GPU.
+
+**Process management:** all long-running jobs are managed via `screen`
+sessions (`redmine-download`, `redmine-ingest`) with output to log files
+in `logs/`. The ingest is fully resumable via upsert.
+
+---
+
+### Phase 10 — Design interview decisions (pending implementation)
+
+A systematic design interview resolved all open architectural questions.
+The following changes are planned for implementation:
+
+#### Data pipeline
+- **openQA URL stripping:** strip `openqa.suse.de` and `openqa.opensuse.org`
+  URLs from description and journal text before embedding (add to
+  `core/anonymizer.py` as a new regex pattern). The URLs add noise to
+  embeddings with no semantic value.
+- **Score threshold:** `store.query()` to return an empty list when all
+  results exceed a minimum L2 distance threshold, rather than always
+  returning top-K regardless of quality.
+
+#### Retrieval
+- **Project metadata filter:** extend `rag.extract_filters()` to also
+  extract project names from natural language ("qe-kernel issues",
+  "containers bugs") and apply as a `project_id` ChromaDB filter alongside
+  status and priority.
+- **Stronger citation instruction:** update the system prompt to require
+  `(Issue #ID)` after every claim, not just suggest it.
+
+#### Interface
+- **Batch query mode:** `pipeline/04_query.py --queries-file questions.txt`
+  reads questions one per line and outputs answers to stdout or a file.
+  Useful for benchmarking retrieval quality.
+- **Background download flag:** `pipeline/01_download.py --background`
+  daemonizes the process and writes to `logs/download.log` automatically,
+  eliminating the need to manually set up `nohup` or `screen`.
+
+#### Evaluation
+- **`tests/eval/` framework:** a curated `questions.jsonl` with
+  `{question, expected_issue_ids[]}` entries. A hit-rate script runs each
+  question against the live collection and reports what fraction of expected
+  issues appear in top-K results.
+
+#### Documentation
+- **`README.md`:** full setup guide, all pipeline steps, all flags,
+  troubleshooting section. Target: a new team member gets from zero to
+  working queries by following the README alone.
+
+---
+
 ## Dependencies
 
 ```
@@ -633,29 +806,51 @@ pytest-cov>=5.0
 ```bash
 # Setup
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-cp .env.example .env   # fill in REDMINE_API_KEY and PROJECT_IDS
+cp .env.example .env   # fill in REDMINE_API_KEY, PROJECT_IDS, etc.
 
-# Pipeline
-python pipeline/01_download.py      # ~0.5s/issue, adaptive rate limiting
-python pipeline/02_anonymize.py     # seconds
-python pipeline/03_ingest.py --reset  # ~5 min for 561 issues / 1121 chunks
+# Full production pipeline
+python pipeline/01_download.py               # adaptive rate limit, crash-safe
+python pipeline/02_anonymize.py              # seconds
+python pipeline/03_ingest.py --reset         # chunks + embeds (~4h for 18k issues on CPU)
+
+# Incremental sync (after first full run)
+python pipeline/01_download.py --sync        # fetches only issues updated since last run
+python pipeline/02_anonymize.py
+python pipeline/03_ingest.py                 # upsert — safe to run without --reset
+
+# Dev mode (isolated, fast cycle)
+python pipeline/01_download.py  --dev        # qesecurity only, data/dev/
+python pipeline/02_anonymize.py --dev
+python pipeline/03_ingest.py    --dev --reset
+python pipeline/04_query.py     --dev --query "..."
 
 # Query
 python pipeline/04_query.py --query "Are there rejected issues and why?"
 python pipeline/04_query.py --query "..." --show-sources
-python pipeline/04_query.py         # interactive REPL
+python pipeline/04_query.py --query "..." --no-filter   # skip LLM filter (~5s faster on CPU)
+python pipeline/04_query.py                              # interactive REPL
+
+# Monitor long-running background jobs
+screen -ls                                   # list screen sessions
+tail -f logs/download.log                    # live download progress
+tail -f logs/ingest.log | grep -v HTTP       # live ingest progress
 ```
 
 ---
 
 ## Known Limitations and Future Work
 
-| Area | Current state | Potential improvement |
+| Area | Current state | Planned / potential improvement |
 |---|---|---|
-| Data volume | Validated on `qam` project (561 issues) | Run full pipeline on all 9 projects (28k issues) |
+| Streaming output | Blocking `ollama.chat()` — silent until done | `ollama.chat(stream=True)` for token-by-token output |
 | Conversation memory | Stateless — each query is independent | Add last-N-turns to `messages[]` for follow-up questions |
-| Streaming output | Blocking `ollama.chat()` call | Use `ollama.chat(stream=True)` for real-time output |
-| Web UI | CLI only | FastAPI + simple frontend |
-| Vector store | ChromaDB only | Abstract store interface to support pgvector, Qdrant |
-| Embedding model | `nomic-embed-text` (512 tokens) | Evaluate `qwen3-embedding` when available context allows |
-| Rate limit discovery | Conservative 0.5s floor | Probe the server to find the actual limit |
+| openQA URL noise | URLs embedded verbatim | Strip `openqa.suse.de` / `openqa.opensuse.org` URLs in anonymizer |
+| Score threshold | Always returns top-K even on poor matches | Return empty result + "no relevant issues" when all scores exceed threshold |
+| Project filter | Only status/priority extracted from NL | Add project name extraction to `extract_filters()` |
+| Batch query mode | Single query or REPL only | `--queries-file` flag for automated benchmarking |
+| Background download | Requires manual `screen` / `nohup` setup | `--background` flag to daemonize + log automatically |
+| Evaluation framework | Manual spot-checking only | `tests/eval/questions.jsonl` + hit-rate script |
+| README | Not written | Full setup → pipeline → flags → troubleshooting guide |
+| GPU / response time | ~30s generation on CPU | GPU or API-based LLM for 2–5s responses |
+| Web UI | CLI only | FastAPI + minimal HTML frontend |
+| Data completeness | 7/9 projects ingested | openqa-infrastructure + containers still downloading |

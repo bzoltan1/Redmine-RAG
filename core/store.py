@@ -120,7 +120,7 @@ class VectorStore:
             metas = [d["metadata"] for d in batch]
             embeddings = self.embedder.embed(texts)
 
-            self._collection.add(
+            self._collection.upsert(
                 ids=ids,
                 documents=texts,
                 metadatas=metas,

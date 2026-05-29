@@ -97,16 +97,16 @@ class TestAdd:
         assert store.count() == 5
 
     def test_batching_respected(self):
-        """With batch_size=2 and 5 docs, we expect 3 add calls."""
+        """With batch_size=2 and 5 docs, we expect 3 upsert calls."""
         store = VectorStore(db_path=None, collection_name=f"col_{uuid.uuid4().hex}", embedder=fake_embedder(), batch_size=2)
-        original_add = store._collection.add
+        original_upsert = store._collection.upsert
         call_count = []
 
-        def counting_add(**kwargs):
+        def counting_upsert(**kwargs):
             call_count.append(1)
-            return original_add(**kwargs)
+            return original_upsert(**kwargs)
 
-        store._collection.add = counting_add
+        store._collection.upsert = counting_upsert
         docs = [make_doc(f"issue_{i}", f"text {i}") for i in range(5)]
         store.add(docs)
         assert sum(call_count) == 3  # ceil(5/2) = 3

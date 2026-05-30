@@ -139,23 +139,29 @@ class VectorStore:
         top_k: int = 5,
         where: dict | None = None,
         deduplicate: bool = True,
+        score_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
         """
         Semantic similarity search.
 
         Parameters
         ----------
-        text:         Query string (embedded with the same model used at ingest).
-        top_k:        Number of unique parent issues to return.
-        where:        Optional ChromaDB metadata filter.
-        deduplicate:  If True (default), keep only the best-scoring chunk per
-                      parent issue_id so the same issue never dominates results.
-                      When False, all matched chunks are returned as-is.
+        text:             Query string (embedded with the same model used at ingest).
+        top_k:            Number of unique parent issues to return.
+        where:            Optional ChromaDB metadata filter.
+        deduplicate:      If True (default), keep only the best-scoring chunk per
+                          parent issue_id so the same issue never dominates results.
+                          When False, all matched chunks are returned as-is.
+        score_threshold:  Maximum L2 distance to accept.  Results whose best score
+                          exceeds this threshold are discarded and an empty list is
+                          returned.  None (default) disables the threshold check.
+                          Lower L2 distance = more similar; typical range 0–2.
 
         Returns
         -------
         List of result dicts, each with keys:
             id, text, metadata, score (lower = more similar for L2 distance).
+        Returns an empty list if no results meet the score_threshold.
         """
         # Over-fetch so deduplication still leaves top_k unique parents.
         fetch_k = top_k * 4 if deduplicate else top_k
@@ -179,4 +185,18 @@ class VectorStore:
         if deduplicate:
             hits = _deduplicate_by_parent(hits)
 
-        return hits[:top_k]
+        hits = hits[:top_k]
+
+        # Apply score threshold: if the best result is still too distant,
+        # the query has no relevant matches in the collection.
+        if score_threshold is not None and hits:
+            best_score = hits[0]["score"]  # sorted ascending after dedup
+            if best_score > score_threshold:
+                logger.info(
+                    "Score threshold %.3f exceeded (best score %.3f); returning no results.",
+                    score_threshold,
+                    best_score,
+                )
+                return []
+
+        return hits

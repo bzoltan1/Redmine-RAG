@@ -44,11 +44,16 @@ generate a natural-language answer using a local Ollama LLM.
 Redmine-RAG/
 │
 ├── PLAN.md                          # this file
+├── README.md                        # setup guide and usage reference
 ├── requirements.txt                 # all Python dependencies
 ├── .env.example                     # template: copy to .env and fill in
 ├── .gitignore
 │
 ├── config.py                        # central config; reads from .env
+│
+├── app.py                           # Flask web interface (/, /status, /eta)
+├── templates/
+│   └── index.html                   # Jinja2 template — form, answer, source cards
 │
 ├── core/                            # business logic — testable, no side effects
 │   ├── __init__.py
@@ -73,18 +78,24 @@ Redmine-RAG/
 │   ├── user_mapping.json            # anonymization mapping (local only)
 │   └── chroma_db/                   # ChromaDB persistent store
 │
+├── README.md                        # setup guide, pipeline steps, all flags
 └── tests/
     ├── conftest.py                  # shared fixtures (synthetic issues, journals)
     ├── unit/
     │   ├── test_document.py         # prepare() and prepare_chunks() coverage
-    │   ├── test_anonymizer.py       # user fields + PII regex scrubbing
-    │   ├── test_checkpoint.py       # save/load/resume/delete
+    │   ├── test_anonymizer.py       # user fields + PII regex + openQA URL scrubbing
+    │   ├── test_checkpoint.py       # save/load/resume/delete + sync state
     │   ├── test_redmine_client.py   # pagination, retry, adaptive backoff
     │   ├── test_embedder.py         # batch embed, context cap, Ollama mocked
-    │   ├── test_store.py            # add, query, deduplication (EphemeralClient)
-    │   └── test_rag.py              # filter extraction, prompt, generate, answer()
-    └── integration/
-        └── test_pipeline.py         # end-to-end: anonymize → ingest → query → answer
+    │   ├── test_store.py            # add, query, deduplication, score threshold
+    │   ├── test_rag.py              # filter extraction (status/priority/project), score threshold, answer()
+    │   ├── test_download.py         # merge_into() counts
+    │   └── test_timing.py           # StageTimer, ProgressBar, PipelineReport
+    ├── integration/
+    │   └── test_pipeline.py         # end-to-end: anonymize → ingest → query → answer
+    └── eval/
+        ├── questions.jsonl          # benchmark questions with expected_ids and tags
+        └── hit_rate.py              # retrieval evaluation script (hit rate @K)
 ```
 
 ---
@@ -108,6 +119,7 @@ All tuneable values in one place, read from `.env` via `python-dotenv`.
 | `BATCH_SIZE` | `50` | Ingest batch size |
 | `MAX_TEXT_LEN` | `4000` | Document char limit (embedder applies 1500-char cap separately) |
 | `TOP_K` | `5` | Unique parent issues returned per query |
+| `SCORE_THRESHOLD` | (unset) | Max L2 distance to accept; empty disables check |
 | `COLLECTION_NAME` | `redmine_issues` | ChromaDB collection name |
 
 ---
@@ -149,13 +161,16 @@ from real user ID to anonymous name is accumulated by the caller and can be
 persisted to `user_mapping.json`.
 
 **Pass 2 — free-text PII scan:** applies regex scrubbing to `description`
-and journal `notes` fields, redacting:
+and journal `notes` fields, redacting in order:
+- openQA test-run URLs (`openqa.suse.de`, `openqa.opensuse.org`) → `[OPENQA-URL]`
 - Email addresses → `[REDACTED-EMAIL]`
 - IPv4 addresses → `[REDACTED-IP]`
 - Internal hostnames (`.suse.de`, `.suse.com`, `.internal`, `.local`, etc.)
   → `[REDACTED-HOST]`
 
-Matches are logged at DEBUG level for review. Content is redacted, not dropped.
+openQA URLs are stripped first so that the hostname fragments they contain
+do not also trigger the `_HOSTNAME_RE` scrubber. Matches are logged at DEBUG
+level for review. Content is redacted, not dropped.
 
 Key functions: `anonymize_issue`, `anonymize_user`, `generate_anonymous_name`,
 `scrub_pii`
@@ -220,8 +235,14 @@ keep only the best-scoring chunk per parent `issue_id`. This ensures that a
 long issue with many chunks cannot dominate the results and crowd out other
 issues.
 
+**Score threshold:** `query()` accepts an optional `score_threshold: float | None`.
+After deduplication and top-K slicing, if the best result's L2 distance exceeds
+the threshold the method returns an empty list. This prevents the LLM from being
+handed irrelevant context on out-of-domain questions. Configure via
+`SCORE_THRESHOLD` in `.env`; disabled by default.
+
 Key class: `VectorStore(db_path, collection_name, embedder, batch_size)`
-Key methods: `add`, `query(text, top_k, where, deduplicate)`, `count`, `reset`
+Key methods: `add`, `query(text, top_k, where, deduplicate, score_threshold)`, `count`, `reset`
 Key helper: `_deduplicate_by_parent(hits)`
 
 ---
@@ -247,11 +268,13 @@ return (answer_text, retrieved, filters)
 ```
 
 **LLM-driven metadata filter extraction:** before retrieval, the question is
-sent to the chat LLM with a short extraction prompt asking for JSON
-`{"status": "...", "priority": "..."}`. Extracted values are validated against
-known Redmine values before being applied as ChromaDB `where=` clauses. This
-handles natural-language queries like "show rejected issues" or "high priority
-bugs" without requiring explicit CLI flags.
+sent to the chat LLM with a short extraction prompt asking for JSON with three
+optional fields: `status`, `priority`, and `project`. Extracted values are
+validated against known Redmine values (statuses, priorities) or a
+`_PROJECT_ALIASES` map (22 natural-language aliases → canonical `project_id`).
+Validated filters are applied as ChromaDB `where=` clauses. This handles
+natural-language queries like "show rejected kernel issues" without requiring
+explicit CLI flags.
 
 **Graceful fallback:** if filters produce zero results, the query is
 automatically retried without filters so the user always gets an answer.
@@ -264,7 +287,7 @@ automatically retried without filters so the user always gets an answer.
 The LLM is instructed to cite issue numbers explicitly in its answer.
 
 Key functions: `extract_filters`, `retrieve`, `build_prompt`, `generate`,
-`answer(question, store, chat_model, ollama_host, top_k, extract_metadata_filters)`
+`answer(question, store, chat_model, ollama_host, top_k, extract_metadata_filters, score_threshold)`
 
 ---
 
@@ -284,6 +307,11 @@ Flow per project:
 Merge all per-project files into `data/redmine_master.json`.
 
 The adaptive backoff in `RedmineClient` handles rate limiting automatically.
+
+Flags: `--dev`, `--since DATE`, `--sync`, `--background`
+
+`--background` re-execs the script detached from the terminal, appending
+output to `logs/download.log`. Returns immediately with the PID.
 
 ---
 
@@ -311,9 +339,13 @@ User-facing RAG interface.
 
 - **Single query**: `python pipeline/04_query.py --query "..."`
 - **Interactive REPL**: `python pipeline/04_query.py`
+- **Batch mode**: `python pipeline/04_query.py --queries-file FILE` — reads
+  questions one per line, writes answers to `<FILE>.results.txt`
 - **Show sources**: add `--show-sources` to print retrieved issue metadata
+- **Skip filter extraction**: add `--no-filter` (~5s saved per query on CPU)
 
-Displays applied metadata filters when the LLM extraction finds any.
+Displays applied metadata filters (status, priority, project) when the LLM
+extraction finds any.
 
 ---
 
@@ -321,18 +353,20 @@ Displays applied metadata filters when the LLM extraction finds any.
 
 ### Unit tests (`tests/unit/`)
 
-210 tests across 7 files. All external I/O is mocked or replaced with
+258 tests across 9 files. All external I/O is mocked or replaced with
 in-memory equivalents.
 
 | Test file | Tests | Key coverage |
 |---|---|---|
 | `test_document.py` | 43 | `prepare()` and `prepare_chunks()`, truncation, chunking layout |
-| `test_anonymizer.py` | 36 | user fields, PII regex (email, IP, hostname), mapping consistency |
+| `test_anonymizer.py` | 43 | user fields, PII regex (email, IP, hostname, openQA URLs), mapping consistency |
 | `test_checkpoint.py` | 17 | atomic save, corrupt-file recovery, completion detection |
 | `test_redmine_client.py` | 21 | pagination, 404/403/401, adaptive backoff on 429/503 |
 | `test_embedder.py` | 11 | batch calls, context cap, Ollama mocked |
-| `test_store.py` | 22 | add, query, reset, deduplication by parent issue |
-| `test_rag.py` | 39 | filter extraction, JSON parsing, prompt richness, answer() full flow |
+| `test_store.py` | 26 | add, query, reset, deduplication, score threshold |
+| `test_rag.py` | 50 | filter extraction (status/priority/project), score threshold forwarding, prompt richness, answer() full flow |
+| `test_download.py` | 7 | merge_into() counts |
+| `test_timing.py` | 28 | StageTimer, ProgressBar, PipelineReport |
 
 ### Integration tests (`tests/integration/`)
 
@@ -341,9 +375,15 @@ ChromaDB. Ollama is mocked at the `core.rag.generate` / `core.rag.extract_filter
 level so the test runs without a running server. Covers anonymization →
 document preparation → ingestion → retrieval → RAG generation end-to-end.
 
+### Evaluation (`tests/eval/`)
+
+`questions.jsonl` — 10 seed benchmark questions (one per project/topic).
+`hit_rate.py` — runs retrieval for each question, reports hit rate @K.
+Expected issue IDs can be populated incrementally as ground truth is verified.
+
 ### Coverage
 
-**96% line coverage** on all `core/` modules (target was 80%).
+**97% line coverage** on all `core/` modules.
 
 ---
 
@@ -736,46 +776,210 @@ in `logs/`. The ingest is fully resumable via upsert.
 
 ---
 
-### Phase 10 — Design interview decisions (pending implementation)
+### Phase 10 — Post-demo improvements (completed 2026-05-30)
 
-A systematic design interview resolved all open architectural questions.
-The following changes are planned for implementation:
+A systematic design interview after the first demo resolved all open
+architectural questions. All planned items were implemented.
 
-#### Data pipeline
-- **openQA URL stripping:** strip `openqa.suse.de` and `openqa.opensuse.org`
-  URLs from description and journal text before embedding (add to
-  `core/anonymizer.py` as a new regex pattern). The URLs add noise to
-  embeddings with no semantic value.
-- **Score threshold:** `store.query()` to return an empty list when all
-  results exceed a minimum L2 distance threshold, rather than always
-  returning top-K regardless of quality.
+#### 10a — openQA URL stripping in `core/anonymizer.py`
 
-#### Retrieval
-- **Project metadata filter:** extend `rag.extract_filters()` to also
-  extract project names from natural language ("qe-kernel issues",
-  "containers bugs") and apply as a `project_id` ChromaDB filter alongside
-  status and priority.
-- **Stronger citation instruction:** update the system prompt to require
-  `(Issue #ID)` after every claim, not just suggest it.
+**Problem:** `openqa.suse.de` and `openqa.opensuse.org` test-run URLs appear
+in thousands of issue descriptions and journal notes. They add noise to
+embeddings with no semantic value (they are machine-generated links, not
+human-written context).
 
-#### Interface
-- **Batch query mode:** `pipeline/04_query.py --queries-file questions.txt`
-  reads questions one per line and outputs answers to stdout or a file.
-  Useful for benchmarking retrieval quality.
-- **Background download flag:** `pipeline/01_download.py --background`
-  daemonizes the process and writes to `logs/download.log` automatically,
-  eliminating the need to manually set up `nohup` or `screen`.
+**Solution:** a new `_OPENQA_URL_RE` pattern (applied before hostname scrubbing)
+strips all `http(s)://openqa.suse.de/...` and `http(s)://openqa.opensuse.org/...`
+URLs, replacing them with `[OPENQA-URL]`. The pattern matches the full URL
+including path and query string so no hostname fragment remains to trigger the
+existing `_HOSTNAME_RE` scrubber.
 
-#### Evaluation
-- **`tests/eval/` framework:** a curated `questions.jsonl` with
-  `{question, expected_issue_ids[]}` entries. A hit-rate script runs each
-  question against the live collection and reports what fraction of expected
-  issues appear in top-K results.
+**Tests added:** 7 new tests in `TestScrubPii` covering both domains, URLs
+with query strings, multiple URLs per text, and ordering with the hostname pass.
 
-#### Documentation
-- **`README.md`:** full setup guide, all pipeline steps, all flags,
-  troubleshooting section. Target: a new team member gets from zero to
-  working queries by following the README alone.
+---
+
+#### 10b — Score threshold in `core/store.py`
+
+**Problem:** `store.query()` always returned top-K results even when the best
+match was semantically unrelated. This caused hallucination — the LLM was
+presented with irrelevant issues and fabricated connections.
+
+**Solution:** `query()` gains an optional `score_threshold: float | None`
+parameter. After deduplication and slicing to `top_k`, if the best score
+(lowest L2 distance) exceeds the threshold the method returns an empty list.
+`rag.retrieve()` and `rag.answer()` forward the parameter through.
+`config.py` exposes `SCORE_THRESHOLD` from the `.env` variable
+`SCORE_THRESHOLD` (unset by default — opt-in). Typical useful values:
+`1.0`–`1.4` for `nomic-embed-text` L2 distances.
+
+**Tests added:** 4 new tests in `TestQuery` covering threshold-below-score,
+threshold-very-large, threshold-none, and forwarding through `retrieve()` and `answer()`.
+
+---
+
+#### 10c — Project name extraction in `core/rag.py`
+
+**Problem:** filter extraction only covered status and priority. Queries like
+"What kernel issues are open?" retrieved results from all 9 projects, diluting
+relevance.
+
+**Solution:** the LLM extraction prompt now includes a third optional field:
+`"project"` — one of the 9 configured project IDs. A `_PROJECT_ALIASES` dict
+maps natural-language aliases (case-insensitive) to canonical `project_id`
+values stored in ChromaDB metadata:
+
+```
+"kernel"     → "qe-kernel"
+"yast"       → "qe-yast"
+"containers" → "containers"
+"openqa"     → "openqatests"
+... (22 aliases total)
+```
+
+Extracted project names are validated against the alias map and emitted as
+`project_id` filter keys in the ChromaDB `where=` clause.
+
+**Tests added:** 6 new tests: exact ID, alias lookup, case-insensitivity,
+unknown project rejection, project+status combination.
+
+---
+
+#### 10d — Stronger citation instruction in `core/rag.py`
+
+**Problem:** the system prompt suggested citing issues but did not require it,
+and models frequently omitted citations on individual sentences.
+
+**Solution:** the system prompt was rewritten to explicitly require `(Issue #ID)`
+after every claim, cite each source individually for multi-issue answers, and
+prohibit any claim without a citation. The instruction to use only retrieved
+issues (not outside knowledge) was also strengthened.
+
+---
+
+#### 10e — `--queries-file` batch mode in `pipeline/04_query.py`
+
+**Solution:** `--queries-file FILE` reads questions one per line (skipping
+blank lines and `#` comments), runs `run_query()` for each, and writes all
+output to `<FILE>.results.txt` alongside stdout. Useful for unattended
+benchmarking runs.
+
+**Docstring and argparse help updated.**
+
+---
+
+#### 10f — `--background` flag in `pipeline/01_download.py`
+
+**Problem:** long-running downloads required manually setting up a `screen`
+or `nohup` session.
+
+**Solution:** `--background` re-execs the same script (minus the flag) using
+`subprocess.Popen` with `start_new_session=True`, appending stdout+stderr to
+`logs/download.log`, then exits immediately. The caller gets a single line
+confirming the PID and log path. No `screen` required.
+
+---
+
+#### 10g — `tests/eval/` evaluation framework
+
+Two new files:
+
+**`tests/eval/questions.jsonl`** — benchmark question set. Each line is a JSON
+object with `question`, `expected_ids` (list of Redmine issue IDs that must
+appear in top-K for a hit), and `tags` for grouping. Lines starting with `#`
+are ignored. Ships with 10 seed questions covering all 9 projects.
+
+**`tests/eval/hit_rate.py`** — evaluation script. Runs retrieval (not
+generation) for each question, reports per-question hit/miss/N/A, and
+summarises hit rate @K. Results are written to a timestamped `.jsonl` file
+alongside stdout. Accepts `--top-k`, `--no-filter`, `--dev`, and `--questions`
+flags.
+
+---
+
+#### 10h — `README.md`
+
+Full documentation written from scratch:
+- How it works (4-step overview)
+- Stack table
+- Setup: prerequisites, install, Ollama model pulls, `.env` configuration
+- All pipeline steps with all flags
+- Dev mode workflow
+- Evaluation usage
+- Test suite instructions
+- Architecture diagram
+- Performance table
+- Monitoring commands
+
+---
+
+#### Test suite after Phase 10
+
+**279 tests, 0 failures.** Coverage maintained at ≥97% on `core/`.
+
+New tests added: 7 (anonymizer) + 4 (store) + 6 (rag project filters) +
+2 (rag score threshold forwarding) + 2 (answer score threshold) = **21 new tests**.
+
+---
+
+### Phase 11 — Flask web frontend (completed 2026-05-30)
+
+#### 11a — `app.py` — Flask web server
+
+A self-contained Flask application modelled on the companion Bugzilla RAG
+project at `/home/balogh/download-bugzilla/`.
+
+**Stack:** Flask 3.x + Jinja2 + vanilla JS + hand-written CSS. No JS
+framework, no separate CSS files. Single `templates/index.html`.
+
+**Routes:**
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/` | GET | Render empty query form |
+| `/` | POST | Run full RAG pipeline, render answer + sources |
+| `/status` | GET | `{"processing": N}` — in-flight request count |
+| `/eta` | GET | `{"eta": seconds}` — rolling average of last 50 durations |
+
+**Concurrency:** thread-safe with a `threading.Lock()` and a plain `int`
+counter. Rolling `deque(maxlen=50)` for ETA estimation. Flask runs with
+`threaded=True` so concurrent requests don't block each other's load time
+(though each query still blocks on its own Ollama call).
+
+**Startup:** calls `VectorStore.__init__()` eagerly on startup (not lazily),
+so the ChromaDB index is loaded once and shared across all requests. The
+store is process-global; no re-init per request.
+
+**Flags:** `--dev`, `--port`, `--host`, `--no-filter`, `--verbose`. All
+forwarded from `argparse` to the same `PipelineConfig` pattern used by
+the pipeline scripts.
+
+---
+
+#### 11b — `templates/index.html` — Jinja2 template
+
+Single self-contained template. Key design choices:
+
+- **About banner** — shows collection size, models, mode, Top-K, filter state
+- **Status bar** — polled once on `window.onload` via `Promise.all([/status, /eta])`
+- **Query form** — `POST /` with `onsubmit="showLoading()"` to disable the
+  button and show a spinner immediately (important on ~40s CPU responses)
+- **Filter badges** — each extracted filter (`status`, `priority`, `project_id`)
+  shown as a pill badge above the answer
+- **Answer** — LLM markdown rendered to HTML via `markdown2`, output with
+  `{{ answer|safe }}` in Jinja2
+- **Source cards** — one card per retrieved issue: direct link to
+  `progress.opensuse.org/issues/<id>`, project/status/priority badges,
+  L2 score, text snippet (max 600 chars, scrollable at 200px)
+- **No results warning** — shown when retrieval returns empty (score threshold
+  or genuinely out-of-domain query)
+- **Error box** — shown on any exception from the RAG pipeline
+
+---
+
+#### 11c — Dependencies added
+
+`Flask>=3.0` and `markdown2>=2.5` added to `requirements.txt`.
 
 ---
 
@@ -791,6 +995,10 @@ chromadb>=0.5
 
 # Embeddings and LLM
 ollama>=0.2
+
+# Web interface
+Flask>=3.0
+markdown2>=2.5
 
 # Testing
 pytest>=8.0
@@ -810,8 +1018,9 @@ cp .env.example .env   # fill in REDMINE_API_KEY, PROJECT_IDS, etc.
 
 # Full production pipeline
 python pipeline/01_download.py               # adaptive rate limit, crash-safe
+python pipeline/01_download.py --background  # same but daemonized → logs/download.log
 python pipeline/02_anonymize.py              # seconds
-python pipeline/03_ingest.py --reset         # chunks + embeds (~4h for 18k issues on CPU)
+python pipeline/03_ingest.py --reset         # chunks + embeds (~6h for 29k issues on CPU)
 
 # Incremental sync (after first full run)
 python pipeline/01_download.py --sync        # fetches only issues updated since last run
@@ -825,13 +1034,22 @@ python pipeline/03_ingest.py    --dev --reset
 python pipeline/04_query.py     --dev --query "..."
 
 # Query
-python pipeline/04_query.py --query "Are there rejected issues and why?"
+python pipeline/04_query.py --query "Are there rejected kernel issues and why?"
 python pipeline/04_query.py --query "..." --show-sources
 python pipeline/04_query.py --query "..." --no-filter   # skip LLM filter (~5s faster on CPU)
+python pipeline/04_query.py --queries-file questions.txt # batch mode → questions.txt.results.txt
 python pipeline/04_query.py                              # interactive REPL
 
-# Monitor long-running background jobs
-screen -ls                                   # list screen sessions
+# Evaluation
+python tests/eval/hit_rate.py                # retrieval hit rate @5
+python tests/eval/hit_rate.py --top-k 10 --no-filter
+
+# Web interface
+python app.py                                # http://localhost:5000
+python app.py --no-filter --port 8080        # skip filter extraction, custom port
+python app.py --dev                          # dev collection
+
+# Monitor background jobs
 tail -f logs/download.log                    # live download progress
 tail -f logs/ingest.log | grep -v HTTP       # live ingest progress
 ```
@@ -840,17 +1058,11 @@ tail -f logs/ingest.log | grep -v HTTP       # live ingest progress
 
 ## Known Limitations and Future Work
 
-| Area | Current state | Planned / potential improvement |
+| Area | Current state | Potential improvement |
 |---|---|---|
 | Streaming output | Blocking `ollama.chat()` — silent until done | `ollama.chat(stream=True)` for token-by-token output |
 | Conversation memory | Stateless — each query is independent | Add last-N-turns to `messages[]` for follow-up questions |
-| openQA URL noise | URLs embedded verbatim | Strip `openqa.suse.de` / `openqa.opensuse.org` URLs in anonymizer |
-| Score threshold | Always returns top-K even on poor matches | Return empty result + "no relevant issues" when all scores exceed threshold |
-| Project filter | Only status/priority extracted from NL | Add project name extraction to `extract_filters()` |
-| Batch query mode | Single query or REPL only | `--queries-file` flag for automated benchmarking |
-| Background download | Requires manual `screen` / `nohup` setup | `--background` flag to daemonize + log automatically |
-| Evaluation framework | Manual spot-checking only | `tests/eval/questions.jsonl` + hit-rate script |
-| README | Not written | Full setup → pipeline → flags → troubleshooting guide |
+| Score threshold tuning | `SCORE_THRESHOLD` defaults to unset | Run `hit_rate.py` at various thresholds to find the optimal value |
+| Evaluation ground truth | `questions.jsonl` has no `expected_ids` yet | Populate expected IDs by running queries and verifying results manually |
 | GPU / response time | ~30s generation on CPU | GPU or API-based LLM for 2–5s responses |
-| Web UI | CLI only | FastAPI + minimal HTML frontend |
-| Data completeness | 7/9 projects ingested | openqa-infrastructure + containers still downloading |
+| Re-ingest after Phase 10 | Anonymized data pre-dates openQA URL stripping | Re-run `02_anonymize.py` + `03_ingest.py --reset` to apply new scrubbing |

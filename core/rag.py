@@ -29,15 +29,46 @@ logger = logging.getLogger(__name__)
 _KNOWN_STATUSES   = {"New", "In Progress", "Resolved", "Rejected", "Closed", "Feedback"}
 _KNOWN_PRIORITIES = {"Low", "Normal", "High", "Urgent", "Immediate"}
 
+# Map of natural-language aliases → canonical project_id stored in ChromaDB.
+# Keys are lowercased for case-insensitive matching.
+_PROJECT_ALIASES: dict[str, str] = {
+    "virtualization":         "virtualization",
+    "virt":                   "virtualization",
+    "performance":            "performance",
+    "perf":                   "performance",
+    "qe security":            "qesecurity",
+    "qesecurity":             "qesecurity",
+    "security":               "qesecurity",
+    "qe kernel":              "qe-kernel",
+    "qe-kernel":              "qe-kernel",
+    "kernel":                 "qe-kernel",
+    "qam":                    "qam",
+    "qe yast":                "qe-yast",
+    "qe-yast":                "qe-yast",
+    "yast":                   "qe-yast",
+    "openqatests":            "openqatests",
+    "openqa tests":           "openqatests",
+    "openqa":                 "openqatests",
+    "openqa infrastructure":  "openqa-infrastructure",
+    "openqa-infrastructure":  "openqa-infrastructure",
+    "infrastructure":         "openqa-infrastructure",
+    "containers":             "containers",
+    "container":              "containers",
+}
+
 # ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = (
     "You are a helpful assistant with access to a Redmine issue tracker database. "
-    "Use the retrieved issues below to answer the user's question as accurately as possible. "
-    "Cite specific issue numbers (e.g. 'Issue #1234') when referring to retrieved issues. "
-    "If the retrieved issues do not contain enough information, say so clearly rather than guessing."
+    "Use ONLY the retrieved issues below to answer the user's question. "
+    "After every claim or piece of information you state, you MUST cite the source "
+    "issue in parentheses, e.g. (Issue #1234). "
+    "If you mention findings from multiple issues, cite each one individually. "
+    "Do not make any claim without a citation. "
+    "If the retrieved issues do not contain enough information to answer, say so clearly "
+    "rather than guessing or using outside knowledge."
 )
 
 _ISSUE_TEMPLATE = (
@@ -59,14 +90,18 @@ Extract any Redmine metadata filters from the following question.
 Return a JSON object with these optional keys:
   "status"   - one of: New, In Progress, Resolved, Rejected, Closed, Feedback
   "priority" - one of: Low, Normal, High, Urgent, Immediate
+  "project"  - one of: virtualization, performance, qesecurity, qe-kernel, qam,
+               qe-yast, openqatests, openqa-infrastructure, containers
 
 Only include a key if you are confident the question is asking to filter by that value.
 If no filters apply, return an empty JSON object: {{}}
 
 Examples:
-  "Show me rejected issues"       -> {{"status": "Rejected"}}
-  "Any high priority bugs?"       -> {{"priority": "High"}}
-  "What is the team working on?"  -> {{}}
+  "Show me rejected issues"                    -> {{"status": "Rejected"}}
+  "Any high priority bugs?"                    -> {{"priority": "High"}}
+  "What kernel issues are open?"               -> {{"project": "qe-kernel", "status": "New"}}
+  "Container failures in the last month"       -> {{"project": "containers"}}
+  "What is the team working on?"               -> {{}}
 
 Question: {question}
 
@@ -117,6 +152,12 @@ def extract_filters(
         validated["status"] = filters["status"]
     if "priority" in filters and filters["priority"] in _KNOWN_PRIORITIES:
         validated["priority"] = filters["priority"]
+    if "project" in filters:
+        raw_project = str(filters["project"]).strip()
+        # Accept exact project_id or a known alias (case-insensitive)
+        canonical = _PROJECT_ALIASES.get(raw_project.lower())
+        if canonical:
+            validated["project_id"] = canonical
 
     if validated:
         logger.info("Extracted filters: %s", validated)
@@ -128,22 +169,33 @@ def retrieve(
     store: VectorStore,
     top_k: int = 5,
     where: dict | None = None,
+    score_threshold: float | None = None,
 ) -> list[dict[str, Any]]:
     """
     Perform semantic search against the vector store.
 
     Parameters
     ----------
-    question: The user's natural-language question.
-    store:    Initialised VectorStore instance.
-    top_k:    Number of unique parent issues to retrieve.
-    where:    Optional ChromaDB metadata filter dict.
+    question:         The user's natural-language question.
+    store:            Initialised VectorStore instance.
+    top_k:            Number of unique parent issues to retrieve.
+    where:            Optional ChromaDB metadata filter dict.
+    score_threshold:  Maximum L2 distance to accept; results beyond this
+                      threshold are discarded and an empty list is returned.
+                      None disables the check.
 
     Returns
     -------
     List of result dicts from VectorStore.query(), deduplicated by parent issue.
+    Empty list if no results meet the score_threshold.
     """
-    return store.query(question, top_k=top_k, where=where or None, deduplicate=True)
+    return store.query(
+        question,
+        top_k=top_k,
+        where=where or None,
+        deduplicate=True,
+        score_threshold=score_threshold,
+    )
 
 
 def build_prompt(question: str, retrieved: list[dict[str, Any]]) -> str:
@@ -203,6 +255,7 @@ def answer(
     ollama_host: str = "http://localhost:11434",
     top_k: int = 5,
     extract_metadata_filters: bool = True,
+    score_threshold: float | None = None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, str]]:
     """
     Full RAG pipeline: extract filters → retrieve → build prompt → generate.
@@ -215,7 +268,11 @@ def answer(
     ollama_host:              Ollama server URL.
     top_k:                    Number of unique issues to retrieve.
     extract_metadata_filters: If True, ask the LLM to extract status/priority
-                              filters from the question before retrieval.
+                              and project filters from the question before retrieval.
+    score_threshold:          Maximum L2 distance to accept from the store.
+                              If the best result exceeds this, retrieval returns
+                              empty and the answer will say so clearly.
+                              None disables the check.
 
     Returns
     -------
@@ -234,12 +291,12 @@ def answer(
         else:
             where = {"$and": [{k: {"$eq": v}} for k, v in filters.items()]}
 
-    retrieved = retrieve(question, store, top_k=top_k, where=where)
+    retrieved = retrieve(question, store, top_k=top_k, where=where, score_threshold=score_threshold)
 
     # If filters produced no results, retry without them
     if not retrieved and where is not None:
         logger.info("Filter produced no results; retrying without filter.")
-        retrieved = retrieve(question, store, top_k=top_k, where=None)
+        retrieved = retrieve(question, store, top_k=top_k, where=None, score_threshold=score_threshold)
         filters = {}
 
     prompt = build_prompt(question, retrieved)

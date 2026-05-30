@@ -3,10 +3,12 @@
 pipeline/04_query.py — Interactive and single-shot RAG Q&A interface.
 
 Flags:
-  --dev          Use dev-mode config (queries 'redmine_issues_dev' collection).
-  --query / -q   Single question (non-interactive mode).
-  --show-sources Print the retrieved source issues alongside the answer.
-  --no-filter    Skip LLM-based metadata filter extraction (~5s saved on CPU).
+  --dev            Use dev-mode config (queries 'redmine_issues_dev' collection).
+  --query / -q     Single question (non-interactive mode).
+  --queries-file   Path to a plain-text file with one question per line.
+                   Results are written to <file>.results.txt alongside the input.
+  --show-sources   Print the retrieved source issues alongside the answer.
+  --no-filter      Skip LLM-based metadata filter extraction (~5s saved on CPU).
 
 Per-stage timing (filter extraction / retrieval / generation) is printed
 after every answer.
@@ -96,10 +98,12 @@ def run_query(
 
         # Stage 2: retrieval
         with StageTimer("Retrieval") as t_r:
-            retrieved = retrieve(question, store, top_k=c.TOP_K, where=where)
+            retrieved = retrieve(question, store, top_k=c.TOP_K, where=where,
+                                 score_threshold=c.SCORE_THRESHOLD)
             if not retrieved and where is not None:
                 log.info("Filter produced no results; retrying without filter.")
-                retrieved = retrieve(question, store, top_k=c.TOP_K)
+                retrieved = retrieve(question, store, top_k=c.TOP_K,
+                                     score_threshold=c.SCORE_THRESHOLD)
                 filters = {}
 
         # Stage 3: generation
@@ -119,6 +123,65 @@ def run_query(
         print_sources(retrieved)
 
     print_timing(t_f.elapsed, t_r.elapsed, t_g.elapsed)
+
+
+def batch_mode(
+    c: PipelineConfig,
+    store: VectorStore,
+    queries_file: str,
+    show_sources: bool,
+    use_filters: bool,
+) -> None:
+    """Run all questions from a file and write answers to <file>.results.txt."""
+    import io
+    from pathlib import Path as _Path
+
+    src = _Path(queries_file)
+    if not src.exists():
+        print(f"ERROR: queries file not found: {queries_file}")
+        sys.exit(1)
+
+    questions = [
+        line.strip()
+        for line in src.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+
+    if not questions:
+        print("No questions found in file.")
+        return
+
+    out_path = src.with_suffix(src.suffix + ".results.txt")
+    print(f"\nBatch mode: {len(questions)} question(s) from {src}")
+    print(f"Results will be written to: {out_path}\n")
+
+    with out_path.open("w", encoding="utf-8") as out:
+        for i, question in enumerate(questions, 1):
+            header = f"=== Q{i}/{len(questions)}: {question} ==="
+            print(header)
+            out.write(header + "\n")
+
+            # Capture stdout for each query into a buffer to write to file too
+            buf = io.StringIO()
+            import contextlib
+
+            class _Tee:
+                def write(self, s):
+                    sys.stdout_orig.write(s)
+                    buf.write(s)
+                def flush(self):
+                    sys.stdout_orig.flush()
+
+            sys.stdout_orig = sys.stdout
+            sys.stdout = _Tee()  # type: ignore[assignment]
+            try:
+                run_query(c, store, question, show_sources, use_filters)
+            finally:
+                sys.stdout = sys.stdout_orig
+            out.write(buf.getvalue())
+            out.write("\n")
+
+    print(f"\nBatch complete. Results written to: {out_path}")
 
 
 def interactive_loop(
@@ -164,6 +227,14 @@ def main() -> None:
     )
     parser.add_argument("--query", "-q", help="Single question (non-interactive mode)")
     parser.add_argument(
+        "--queries-file", metavar="FILE",
+        help=(
+            "Path to a plain-text file with one question per line. "
+            "Answers are written to <FILE>.results.txt. "
+            "Blank lines and lines starting with '#' are skipped."
+        ),
+    )
+    parser.add_argument(
         "--show-sources", action="store_true",
         help="Print the retrieved source issues alongside the answer.",
     )
@@ -199,7 +270,9 @@ def main() -> None:
     if not use_filters:
         print("  Filter extraction disabled (--no-filter).")
 
-    if args.query:
+    if args.queries_file:
+        batch_mode(c, store, args.queries_file, args.show_sources, use_filters)
+    elif args.query:
         run_query(c, store, args.query, args.show_sources, use_filters)
     else:
         interactive_loop(c, store, args.show_sources, use_filters)

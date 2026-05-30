@@ -2,6 +2,10 @@
 requests>=2.31
 python-dotenv>=1.0
 
+# Web interface
+Flask>=3.0
+markdown2>=2.5
+
 # Vector store
 chromadb>=0.5
 

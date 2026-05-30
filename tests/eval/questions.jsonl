@@ -1,0 +1,19 @@
+# Evaluation questions for the Redmine RAG system.
+# Format: one JSON object per line.
+# Fields:
+#   question         - natural language query
+#   expected_ids     - list of Redmine issue IDs that MUST appear in top-K results
+#   tags             - optional list of labels for grouping results (e.g. project, type)
+#
+# Lines starting with '#' are ignored.
+
+{"question": "What kernel-related issues have been reported as high priority?", "expected_ids": [], "tags": ["qe-kernel", "priority"]}
+{"question": "Are there any open security vulnerabilities in the qesecurity project?", "expected_ids": [], "tags": ["qesecurity", "security"]}
+{"question": "What container startup failures have been reported?", "expected_ids": [], "tags": ["containers"]}
+{"question": "Which virtualization issues were resolved recently?", "expected_ids": [], "tags": ["virtualization", "resolved"]}
+{"question": "What performance regressions have been found?", "expected_ids": [], "tags": ["performance"]}
+{"question": "Are there any urgent yast issues currently open?", "expected_ids": [], "tags": ["qe-yast", "urgent"]}
+{"question": "What openqa test failures relate to network configuration?", "expected_ids": [], "tags": ["openqatests", "network"]}
+{"question": "What issues mention kernel panic on boot?", "expected_ids": [], "tags": ["kernel", "boot"]}
+{"question": "Which issues were rejected in the qam project?", "expected_ids": [], "tags": ["qam", "rejected"]}
+{"question": "What infrastructure problems have been reported in openqa-infrastructure?", "expected_ids": [], "tags": ["openqa-infrastructure"]}

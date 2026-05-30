@@ -134,6 +134,47 @@ class TestExtractFilters:
         assert result.get("status") == "New"
         assert result.get("priority") == "Urgent"
 
+    def test_project_extracted_by_exact_id(self):
+        with patch("core.rag.Client") as MockClient:
+            MockClient.return_value.chat.return_value = mock_chat_response(
+                '{"project": "containers"}'
+            )
+            result = extract_filters("container failures", model="llama3")
+        assert result.get("project_id") == "containers"
+
+    def test_project_extracted_by_alias(self):
+        with patch("core.rag.Client") as MockClient:
+            MockClient.return_value.chat.return_value = mock_chat_response(
+                '{"project": "kernel"}'
+            )
+            result = extract_filters("kernel panic issues", model="llama3")
+        assert result.get("project_id") == "qe-kernel"
+
+    def test_project_alias_case_insensitive(self):
+        with patch("core.rag.Client") as MockClient:
+            MockClient.return_value.chat.return_value = mock_chat_response(
+                '{"project": "Containers"}'
+            )
+            result = extract_filters("container issues", model="llama3")
+        assert result.get("project_id") == "containers"
+
+    def test_unknown_project_filtered_out(self):
+        with patch("core.rag.Client") as MockClient:
+            MockClient.return_value.chat.return_value = mock_chat_response(
+                '{"project": "totally_unknown_project"}'
+            )
+            result = extract_filters("anything", model="llama3")
+        assert "project_id" not in result
+
+    def test_project_and_status_combined(self):
+        with patch("core.rag.Client") as MockClient:
+            MockClient.return_value.chat.return_value = mock_chat_response(
+                '{"project": "qe-kernel", "status": "New"}'
+            )
+            result = extract_filters("open kernel issues", model="llama3")
+        assert result.get("project_id") == "qe-kernel"
+        assert result.get("status") == "New"
+
 
 # ---------------------------------------------------------------------------
 # retrieve()
@@ -143,7 +184,9 @@ class TestRetrieve:
     def test_delegates_to_store_query(self):
         store = make_store_mock([make_result()])
         results = retrieve("why does container fail?", store, top_k=3)
-        store.query.assert_called_once_with("why does container fail?", top_k=3, where=None, deduplicate=True)
+        store.query.assert_called_once_with(
+            "why does container fail?", top_k=3, where=None, deduplicate=True, score_threshold=None
+        )
         assert len(results) == 1
 
     def test_returns_empty_list_on_no_results(self):
@@ -156,6 +199,18 @@ class TestRetrieve:
         retrieve("question", store, where={"status": {"$eq": "Rejected"}})
         _, kwargs = store.query.call_args
         assert kwargs["where"] == {"status": {"$eq": "Rejected"}}
+
+    def test_score_threshold_forwarded_to_store(self):
+        store = make_store_mock()
+        retrieve("question", store, score_threshold=1.2)
+        _, kwargs = store.query.call_args
+        assert kwargs["score_threshold"] == 1.2
+
+    def test_score_threshold_none_forwarded(self):
+        store = make_store_mock()
+        retrieve("question", store, score_threshold=None)
+        _, kwargs = store.query.call_args
+        assert kwargs["score_threshold"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -329,3 +384,17 @@ class TestAnswer:
             answer("question", store, chat_model="llama3", top_k=8)
         _, kwargs = store.query.call_args
         assert kwargs["top_k"] == 8
+
+    def test_score_threshold_forwarded_through_answer(self):
+        store = make_store_mock()
+        with self._mock_generate(), self._mock_extract():
+            answer("question", store, chat_model="llama3", score_threshold=1.2)
+        _, kwargs = store.query.call_args
+        assert kwargs["score_threshold"] == 1.2
+
+    def test_score_threshold_none_by_default(self):
+        store = make_store_mock()
+        with self._mock_generate(), self._mock_extract():
+            answer("question", store, chat_model="llama3")
+        _, kwargs = store.query.call_args
+        assert kwargs["score_threshold"] is None

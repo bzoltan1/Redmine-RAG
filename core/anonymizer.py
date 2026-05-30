@@ -6,6 +6,8 @@ Two-pass anonymization:
      journal users, watchers) with User_XXXXX placeholders.
   2. Free-text PII scan — redact email addresses, IPv4 addresses, and
      likely internal hostnames from description and journal notes fields.
+     Also strips openQA test-run URLs (openqa.suse.de / openqa.opensuse.org)
+     which add noise without semantic value.
      Matches are logged so they can be reviewed; content is not dropped.
 
 Pure data transformation — no file I/O.
@@ -41,9 +43,22 @@ _HOSTNAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+# openQA test-run URLs — these are high-volume, machine-generated links that
+# add noise without semantic value.  Strip the full URL so the surrounding
+# prose remains readable.
+# Matches both http and https, with or without a trailing path/query.
+# Examples:
+#   https://openqa.suse.de/tests/12345678
+#   http://openqa.opensuse.org/tests/12345#step/boot/1
+_OPENQA_URL_RE = re.compile(
+    r"https?://openqa\.(?:suse\.de|opensuse\.org)\S*",
+    re.IGNORECASE,
+)
+
 _REDACT_EMAIL    = "[REDACTED-EMAIL]"
 _REDACT_IPV4     = "[REDACTED-IP]"
 _REDACT_HOSTNAME = "[REDACTED-HOST]"
+_REDACT_OPENQA   = "[OPENQA-URL]"
 
 
 def generate_anonymous_name(user_id: int) -> str:
@@ -110,9 +125,10 @@ def scrub_pii(text: str, issue_id: int | str = "?") -> str:
             logger.debug("PII redacted in issue #%s: %s -> %s", issue_id, m, replacement)
         return pattern.sub(replacement, src)
 
-    text = _replace(_EMAIL_RE,    _REDACT_EMAIL,    text)
-    text = _replace(_IPV4_RE,     _REDACT_IPV4,     text)
-    text = _replace(_HOSTNAME_RE, _REDACT_HOSTNAME, text)
+    text = _replace(_OPENQA_URL_RE, _REDACT_OPENQA,   text)
+    text = _replace(_EMAIL_RE,      _REDACT_EMAIL,    text)
+    text = _replace(_IPV4_RE,       _REDACT_IPV4,     text)
+    text = _replace(_HOSTNAME_RE,   _REDACT_HOSTNAME, text)
     return text
 
 

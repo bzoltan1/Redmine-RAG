@@ -20,9 +20,10 @@ Incremental sync (--since DATE or --sync)
 
 Flags
 -----
---dev       Use dev-mode config (qesecurity project, data/dev/).
---since     ISO-8601 date for incremental sync (e.g. 2025-12-02).
---sync      Shorthand for --since <last_synced_at> from sync state file.
+--dev        Use dev-mode config (qesecurity project, data/dev/).
+--since      ISO-8601 date for incremental sync (e.g. 2025-12-02).
+--sync       Shorthand for --since <last_synced_at> from sync state file.
+--background Daemonize: detach and append output to logs/download.log.
 
 Timing summary is printed at the end.
 Configuration comes from .env via config.py.
@@ -30,6 +31,7 @@ Configuration comes from .env via config.py.
 
 import argparse
 import json
+import os
 import sys
 import time
 import logging
@@ -224,6 +226,17 @@ def download_project_full(
         )
 
     all_issues = list(issues_map.values())
+
+    # Apply journals-only filter for configured projects
+    if project_id in c.JOURNALS_ONLY_PROJECTS:
+        before = len(all_issues)
+        all_issues = [i for i in all_issues if i.get("journals")]
+        dropped = before - len(all_issues)
+        progress(
+            f"  [{project_id}] journals-only filter: kept {len(all_issues)}/{before} "
+            f"(dropped {dropped} issues with no journals)"
+        )
+
     save_project_data(c, project_id, all_issues)
     ckpt.delete(cp_path)
 
@@ -385,7 +398,35 @@ Examples:
             "Fails with an error if no previous sync state exists."
         ),
     )
+    parser.add_argument(
+        "--background", action="store_true",
+        help=(
+            "Daemonize: re-launch this process detached from the terminal, "
+            "appending output to logs/download.log. "
+            "Returns immediately; monitor with: tail -f logs/download.log"
+        ),
+    )
     args = parser.parse_args()
+    # Handle --background: re-exec detached before doing any real work
+    if args.background:
+        log_path = Path(__file__).parent.parent / "logs" / "download.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Build the command without --background to avoid recursive daemonising
+        new_argv = [a for a in sys.argv[1:] if a != "--background"]
+        cmd = [sys.executable, "-u", str(Path(__file__).resolve())] + new_argv
+        with log_path.open("a") as log_fh:
+            import subprocess
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_fh,
+                stderr=log_fh,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        print(f"Download started in background (PID {proc.pid}).")
+        print(f"Monitor: tail -f {log_path}")
+        sys.exit(0)
+
     c = cfg.dev() if args.dev else cfg.prod()
 
     # Resolve sync date

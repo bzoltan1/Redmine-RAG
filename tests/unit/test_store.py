@@ -188,6 +188,44 @@ class TestQuery:
         # Without dedup, both chunks from 42 can appear
         assert issue_ids.count("42") >= 1
 
+    def test_score_threshold_none_returns_results(self):
+        """With score_threshold=None (default), results are returned normally."""
+        store = make_store()
+        store.add([make_doc("issue_1", "kernel networking failure")])
+        results = store.query("kernel", top_k=1, score_threshold=None)
+        assert len(results) == 1
+
+    def test_score_threshold_below_best_score_returns_empty(self):
+        """When score_threshold < best score, results are suppressed.
+        The stub embedder returns identical vectors so L2 distance is always 0.0.
+        We verify the threshold logic by directly calling with a threshold of -0.1
+        (impossible to satisfy since L2 >= 0), confirming the > comparison works.
+        """
+        store = make_store()
+        store.add([make_doc("issue_1", "test document")])
+        # L2 distance is 0.0 with stub embedder; threshold -0.1 means 0.0 > -0.1 = True -> empty
+        results = store.query("test", top_k=1, score_threshold=-0.1)
+        assert results == []
+
+    def test_score_threshold_very_large_returns_results(self):
+        """With a very large threshold, all results pass."""
+        store = make_store()
+        store.add([make_doc("issue_1", "some text")])
+        results = store.query("some text", top_k=1, score_threshold=999.0)
+        assert len(results) == 1
+
+    def test_score_threshold_empty_hits_returns_empty(self):
+        """Score threshold with no hits in collection returns empty without error."""
+        store = make_store()
+        # Query an empty collection — results will be empty before threshold check
+        # (ChromaDB raises if collection is empty, so add then reset)
+        store.add([make_doc("issue_1", "text")])
+        store.reset()
+        # Re-add one doc so count > 0 but use impossible threshold
+        store.add([make_doc("issue_1", "text")])
+        results = store.query("anything", top_k=1, score_threshold=-1.0)
+        assert results == []
+
 
 class TestDeduplicateByParent:
     def _hit(self, issue_id: str, chunk_id: str, score: float) -> dict:

@@ -79,6 +79,25 @@ MAX_TEXT_LEN: int = int(os.getenv("MAX_TEXT_LEN", "8192"))
 # Query
 # ---------------------------------------------------------------------------
 TOP_K: int = int(os.getenv("TOP_K", "5"))
+# Maximum L2 distance to accept from the vector store.  Results whose best
+# score exceeds this threshold are treated as "no relevant match found".
+# None disables the check.  Typical nomic-embed-text L2 range: 0.0–2.0.
+# A value around 1.2 rejects clearly unrelated queries while keeping
+# borderline relevant results.
+_raw_score_threshold = os.getenv("SCORE_THRESHOLD", "")
+SCORE_THRESHOLD: float | None = float(_raw_score_threshold) if _raw_score_threshold else None
+
+# ---------------------------------------------------------------------------
+# Per-project filters
+# ---------------------------------------------------------------------------
+# Comma-separated list of project IDs for which only issues that have at
+# least one journal entry should be downloaded and ingested.
+# Useful for auto-generated projects like openqatests where most issues
+# have no human commentary and add noise rather than signal.
+_raw_journals_only = os.getenv("JOURNALS_ONLY_PROJECTS", "openqatests")
+JOURNALS_ONLY_PROJECTS: set[str] = {
+    p.strip() for p in _raw_journals_only.split(",") if p.strip()
+}
 
 # ---------------------------------------------------------------------------
 # Development mode overrides
@@ -126,6 +145,9 @@ class PipelineConfig:
     MAX_TEXT_LEN: int
     # Query
     TOP_K: int
+    SCORE_THRESHOLD: float | None
+    # Per-project filters
+    JOURNALS_ONLY_PROJECTS: set
     # Mode
     is_dev: bool = False
 
@@ -157,6 +179,8 @@ def prod() -> PipelineConfig:
         BATCH_SIZE=BATCH_SIZE,
         MAX_TEXT_LEN=MAX_TEXT_LEN,
         TOP_K=TOP_K,
+        SCORE_THRESHOLD=SCORE_THRESHOLD,
+        JOURNALS_ONLY_PROJECTS=JOURNALS_ONLY_PROJECTS,
         is_dev=False,
     )
 
@@ -189,5 +213,7 @@ def dev() -> PipelineConfig:
         BATCH_SIZE=BATCH_SIZE,
         MAX_TEXT_LEN=MAX_TEXT_LEN,
         TOP_K=TOP_K,
+        SCORE_THRESHOLD=SCORE_THRESHOLD,
+        JOURNALS_ONLY_PROJECTS=JOURNALS_ONLY_PROJECTS,
         is_dev=True,
     )

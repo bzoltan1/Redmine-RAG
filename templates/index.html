@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Redmine RAG — Ask your issue tracker</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 2em 1.5em;
+      background: #f5f5f5;
+      color: #222;
+      line-height: 1.6;
+    }
+
+    h1 { font-size: 1.8em; margin-bottom: 0.15em; }
+    h2 { font-size: 1.15em; margin-top: 1.5em; }
+    h3 { font-size: 1em; margin-top: 1.4em; color: #444; }
+    a  { color: #0066cc; }
+
+    /* ---- About banner ---- */
+    .about {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-left: 4px solid #0066cc;
+      border-radius: 6px;
+      padding: 0.9em 1.2em;
+      margin-bottom: 1.4em;
+      font-size: 0.92em;
+      color: #333;
+    }
+    .about p { margin: 0.35em 0; }
+    .about code {
+      background: #eef;
+      padding: 0.1em 0.3em;
+      border-radius: 3px;
+      font-size: 0.91em;
+    }
+
+    /* ---- Status bar ---- */
+    .status-bar {
+      display: flex;
+      gap: 1em;
+      font-size: 0.87em;
+      color: #555;
+      margin-bottom: 1em;
+      flex-wrap: wrap;
+    }
+    .status-bar span {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 0.25em 0.7em;
+    }
+
+    /* ---- Form ---- */
+    form { margin-bottom: 1em; }
+    textarea {
+      width: 100%;
+      font-size: 1em;
+      padding: 0.6em 0.8em;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      resize: vertical;
+      font-family: inherit;
+      min-height: 90px;
+    }
+    textarea:focus {
+      outline: none;
+      border-color: #0066cc;
+      box-shadow: 0 0 0 2px #cce0ff;
+    }
+    .form-footer {
+      display: flex;
+      align-items: center;
+      gap: 1em;
+      margin-top: 0.5em;
+    }
+    button {
+      padding: 0.5em 1.5em;
+      font-size: 1em;
+      background: #0066cc;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    button:hover    { background: #0052a3; }
+    button:disabled { background: #88aacc; cursor: not-allowed; }
+    #loading {
+      display: none;
+      color: #555;
+      font-style: italic;
+      font-size: 0.92em;
+    }
+
+    /* ---- Filters badge ---- */
+    .filters-applied {
+      display: inline-flex;
+      gap: 0.5em;
+      flex-wrap: wrap;
+      margin-bottom: 0.6em;
+    }
+    .filter-badge {
+      background: #e8f0fe;
+      border: 1px solid #b0c8f8;
+      border-radius: 12px;
+      padding: 0.15em 0.65em;
+      font-size: 0.82em;
+      color: #1a4a9e;
+    }
+
+    /* ---- Answer box ---- */
+    .answer-box {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 1.2em 1.4em;
+      margin-top: 1.2em;
+    }
+    .answer-box .meta {
+      font-size: 0.84em;
+      color: #666;
+      margin-bottom: 0.8em;
+    }
+    .answer-body { line-height: 1.75; }
+    .answer-body p  { margin: 0.55em 0; }
+    .answer-body ul,
+    .answer-body ol { padding-left: 1.5em; }
+    .answer-body code {
+      background: #f0f0f0;
+      padding: 0.1em 0.3em;
+      border-radius: 3px;
+      font-size: 0.91em;
+    }
+    .answer-body pre {
+      background: #f0f0f0;
+      padding: 0.8em;
+      border-radius: 6px;
+      overflow-x: auto;
+    }
+
+    /* ---- Source cards ---- */
+    .sources { margin-top: 1.4em; }
+    .source-card {
+      background: #fafafa;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 0.85em 1.1em;
+      margin-bottom: 0.7em;
+      font-size: 0.88em;
+    }
+    .source-header {
+      font-weight: 600;
+      margin-bottom: 0.4em;
+    }
+    .source-header a { text-decoration: none; }
+    .source-header a:hover { text-decoration: underline; }
+    .source-meta {
+      color: #666;
+      font-size: 0.84em;
+      margin-bottom: 0.45em;
+      display: flex;
+      gap: 0.6em;
+      flex-wrap: wrap;
+    }
+    .badge {
+      background: #f0f0f0;
+      border: 1px solid #ddd;
+      border-radius: 3px;
+      padding: 0.05em 0.45em;
+      font-size: 0.92em;
+    }
+    .badge-score { color: #666; }
+    .source-body {
+      white-space: pre-wrap;
+      color: #333;
+      line-height: 1.5;
+      max-height: 200px;
+      overflow-y: auto;
+      font-size: 0.95em;
+    }
+
+    /* ---- Error box ---- */
+    .error-box {
+      background: #fff0f0;
+      border: 1px solid #f5c6c6;
+      border-radius: 6px;
+      padding: 0.9em 1.2em;
+      margin-top: 1em;
+      color: #c00;
+    }
+
+    /* ---- No results ---- */
+    .no-results {
+      background: #fffbe6;
+      border: 1px solid #f0d070;
+      border-radius: 6px;
+      padding: 0.9em 1.2em;
+      margin-top: 1em;
+      color: #7a5c00;
+      font-size: 0.93em;
+    }
+  </style>
+
+  <script>
+    function showLoading() {
+      document.getElementById("loading").style.display = "inline";
+      document.getElementById("ask-btn").disabled = true;
+    }
+
+    async function updateStatus() {
+      try {
+        const [sRes, eRes] = await Promise.all([fetch("/status"), fetch("/eta")]);
+        const s = await sRes.json();
+        const e = await eRes.json();
+        const reqEl = document.getElementById("status-requests");
+        const etaEl = document.getElementById("status-eta");
+        reqEl.textContent = s.processing === 0
+          ? "Idle"
+          : s.processing + " quer" + (s.processing === 1 ? "y" : "ies") + " in progress";
+        if (s.processing > 0 && e.eta > 0) {
+          etaEl.textContent = "Est. wait: ~" + e.eta + "s";
+          etaEl.style.display = "";
+        } else {
+          etaEl.style.display = "none";
+        }
+      } catch (_) {}
+    }
+
+    window.onload = updateStatus;
+  </script>
+</head>
+<body>
+
+  <h1>Ask Redmine</h1>
+
+  <div class="about">
+    <p>
+      Natural-language search over <strong>{{ "{:,}".format(collection_size) }} chunks</strong>
+      from <strong>29,544 Redmine issues</strong> across 9 SUSE/openSUSE QA projects.
+    </p>
+    <p>
+      Pipeline: <code>{{ "nomic-embed-text" }}</code> embeddings &rarr;
+      ChromaDB (67,797 chunks) &rarr;
+      <code>llama3</code> via Ollama &rarr; answer with source issue links.
+      All local &mdash; no cloud APIs.
+    </p>
+    <p>
+      Mode: <strong>{{ mode }}</strong> &nbsp;|&nbsp;
+      Top-K: <strong>{{ top_k }}</strong> &nbsp;|&nbsp;
+      Filter extraction: <strong>{{ "enabled" if use_filters else "disabled" }}</strong>
+    </p>
+  </div>
+
+  <div class="status-bar">
+    <span id="status-requests">Checking&hellip;</span>
+    <span id="status-eta" style="display:none"></span>
+  </div>
+
+  <form method="post" onsubmit="showLoading()">
+    <textarea
+      name="question"
+      placeholder="e.g. What high-priority kernel issues are currently open?  /  Are there any open security issues in the containers project?  /  What caused recent test failures in openqatests?"
+    >{{ question }}</textarea>
+    <div class="form-footer">
+      <button id="ask-btn" type="submit">Ask</button>
+      <span id="loading">Processing&hellip; (this takes ~30&ndash;55 seconds on CPU)</span>
+    </div>
+  </form>
+
+  {% if error %}
+  <div class="error-box"><strong>Error:</strong> {{ error }}</div>
+  {% endif %}
+
+  {% if answer %}
+  <div class="answer-box">
+    <div class="meta">
+      Answer generated in {{ elapsed }}s
+      {% if filters %}
+      &nbsp;&mdash;&nbsp; filters applied:
+      {% endif %}
+    </div>
+
+    {% if filters %}
+    <div class="filters-applied">
+      {% for key, val in filters.items() %}
+      <span class="filter-badge">{{ key }}: {{ val }}</span>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <div class="answer-body">{{ answer|safe }}</div>
+  </div>
+
+  {% if sources %}
+  <div class="sources">
+    <h3>Source issues retrieved (top {{ sources|length }})</h3>
+    {% for doc in sources %}
+    <div class="source-card">
+      <div class="source-header">
+        <a href="{{ doc.issue_url }}" target="_blank" rel="noopener">
+          Issue #{{ doc.issue_id }}
+        </a>
+        {% if doc.subject %} &mdash; {{ doc.subject }}{% endif %}
+      </div>
+      <div class="source-meta">
+        {% if doc.project %}<span class="badge">{{ doc.project }}</span>{% endif %}
+        {% if doc.status  %}<span class="badge">{{ doc.status }}</span>{% endif %}
+        {% if doc.priority and doc.priority != "Normal" %}
+          <span class="badge">{{ doc.priority }}</span>
+        {% endif %}
+        {% if doc.updated_on %}<span>updated {{ doc.updated_on }}</span>{% endif %}
+        <span class="badge-score">score: {{ doc.score }}</span>
+      </div>
+      <div class="source-body">{{ doc.snippet }}</div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="no-results">
+    No relevant issues were retrieved. The question may be outside the scope of
+    the indexed data, or the score threshold filtered all candidates. Try
+    rephrasing or broadening your question.
+  </div>
+  {% endif %}
+
+  {% endif %}
+
+</body>
+</html>

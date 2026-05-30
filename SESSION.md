@@ -1,7 +1,7 @@
 # Redmine RAG — Session Memory
 
-This file records the full context of the redesign and implementation session
-so work can be resumed without loss of context.
+This file records the full context of the current session so work can be
+resumed without loss of context.
 
 ---
 
@@ -23,10 +23,10 @@ questions by retrieving relevant issues and generating answers with a local LLM.
 | Component | Choice | Notes |
 |---|---|---|
 | Vector store | ChromaDB (persistent) | `data/chroma_db/` |
-| Embedding model | `nomic-embed-text` | via Ollama, ~2.8 chunks/s on this CPU |
+| Embedding model | `nomic-embed-text` | via Ollama, ~3.2 chunks/s on this CPU |
 | Chat model | `llama3` | CPU only, ~25–55s/query |
 | Language | Python 3.13 | venv at `.venv/` |
-| Test runner | pytest | 260 tests, 97% coverage |
+| Test runner | pytest | 279 tests, 97% coverage |
 
 ---
 
@@ -34,100 +34,108 @@ questions by retrieving relevant issues and generating answers with a local LLM.
 
 ```
 Redmine-RAG/
-├── config.py                    # central config + dev/prod factory + JOURNALS_ONLY_PROJECTS
+├── config.py                    # central config + dev/prod factory + SCORE_THRESHOLD
 ├── .env                         # API key, model names, paths (not committed)
 ├── .env.example                 # template
 ├── requirements.txt
+├── README.md                    # full setup and usage documentation
 ├── PLAN.md                      # full design + implementation history
 ├── SESSION.md                   # this file
 ├── DEMO.md                      # demo script for QA engineers
 ├── logs/
-│   ├── download.log             # live download progress (screen session)
-│   └── ingest.log               # live ingest progress (screen session)
+│   ├── download.log             # download progress (--background or screen session)
+│   └── ingest.log               # ingest progress
 │
 ├── core/
-│   ├── anonymizer.py            # user fields + PII regex + openQA URL stripping (TODO)
-│   ├── checkpoint.py            # download checkpoints + sync state (save_sync_state etc.)
+│   ├── anonymizer.py            # user fields + PII regex + openQA URL stripping
+│   ├── checkpoint.py            # download checkpoints + sync state
 │   ├── document.py              # prepare() and prepare_chunks()
 │   ├── embedder.py              # OllamaEmbedder, max_chars=1500, batch HTTP call
-│   ├── rag.py                   # extract_filters + retrieve + generate + answer()
+│   ├── rag.py                   # extract_filters (status/priority/project) + retrieve + generate
 │   ├── redmine_client.py        # REST API + adaptive backoff + fetch_updated_since()
-│   ├── store.py                 # ChromaDB wrapper, upsert, deduplication
+│   ├── store.py                 # ChromaDB wrapper, upsert, deduplication, score_threshold
 │   └── timing.py                # StageTimer, ProgressBar, PipelineReport
 │
+├── app.py                       # Flask web interface (/, /status, /eta)
+├── templates/
+│   └── index.html               # Jinja2 template — form, answer, source cards
+│
 ├── pipeline/
-│   ├── 01_download.py           # full + incremental (--since/--sync) + --dev + crash-safe
+│   ├── 01_download.py           # full + incremental (--since/--sync) + --dev + --background
 │   ├── 02_anonymize.py          # anonymize + PII scrub, --dev
 │   ├── 03_ingest.py             # chunk + embed + upsert, --dev / --reset
-│   └── 04_query.py              # RAG Q&A, --dev / --no-filter / --show-sources
+│   └── 04_query.py              # RAG Q&A, --dev / --no-filter / --show-sources / --queries-file
 │
 ├── tests/
 │   ├── conftest.py
-│   ├── unit/                    # 8 test files, one per core module
-│   │   └── test_download.py     # merge_into() tests
-│   └── integration/
-│       └── test_pipeline.py
+│   ├── unit/                    # 9 test files, one per core module
+│   │   ├── test_anonymizer.py   # incl. openQA URL tests
+│   │   ├── test_checkpoint.py
+│   │   ├── test_document.py
+│   │   ├── test_download.py
+│   │   ├── test_embedder.py
+│   │   ├── test_rag.py          # incl. project filter + score threshold tests
+│   │   ├── test_redmine_client.py
+│   │   ├── test_store.py        # incl. score threshold tests
+│   │   └── test_timing.py
+│   ├── integration/
+│   │   └── test_pipeline.py
+│   └── eval/
+│       ├── questions.jsonl      # 10 seed benchmark questions
+│       └── hit_rate.py          # retrieval evaluation script
 │
 └── data/                        # gitignored
     ├── raw/                     # per-project JSON + checkpoints + sync state
-    ├── redmine_master.json      # merged prod dataset (18,069 issues currently)
-    ├── redmine_anonymized.json  # anonymized (18,069 issues)
-    ├── chroma_db/               # production ChromaDB (13,700 chunks, growing)
+    ├── redmine_master.json      # merged prod dataset (29,544 issues)
+    ├── redmine_anonymized.json  # anonymized (29,544 issues, 384 users)
+    ├── user_mapping.json        # anonymization map
+    ├── chroma_db/               # production ChromaDB (67,797 chunks — fully ingested)
     └── dev/                     # isolated dev data
-        └── raw/qesecurity.json  # 765 issues, 98% journal coverage
+        └── raw/qesecurity.json  # 765 issues
 ```
 
 ---
 
-## Current data state (2026-05-29)
+## Current data state (2026-05-30)
 
-### Production download (`data/raw/`)
+### Production download (`data/raw/`) — COMPLETE
 
-| Project | Issues | Journals | Status |
-|---|---|---|---|
-| virtualization | 2,778 | ~74% done | journal re-fetch in progress |
-| performance | 2,076 | 93% | done |
-| qesecurity | 765 | 98% | done |
-| qe-kernel | 1,867 | ~80% | journal re-fetch in progress |
-| qam | 561 | 76% | done |
-| qe-yast | 2,429 | 99% | done |
-| openqatests | 13,247 | 57% (journals-only filter will keep ~7,600) | in progress |
-| openqa-infrastructure | 0 | — | not started |
-| containers | 0 | — | not started |
+| Project | Issues | Status |
+|---|---|---|
+| virtualization | 2,778 | done |
+| performance | 2,076 | done |
+| qesecurity | 765 | done |
+| qe-kernel | 1,867 | done |
+| qam | 561 | done |
+| qe-yast | 2,431 | done |
+| openqatests | 13,247 | done (journals-only filter: 7,593 kept) |
+| openqa-infrastructure | ~1,242 | done (new — Phase 9 completion) |
+| containers | 3,577 | done (new — Phase 9 completion) |
 
-**Master dataset:** 18,069 issues merged from 7 projects
-**Anonymized:** `data/redmine_anonymized.json` (18,069 issues, 301 users)
-**ChromaDB:** 13,700 / 40,509 chunks embedded (~34%, ingest running)
+**Master dataset:** 29,544 issues (all 9 projects)
+**Anonymized:** `data/redmine_anonymized.json` (29,544 issues, 384 users)
+**ChromaDB:** 67,797 chunks, **fully ingested** (5h 52m at 3.2 chunks/s)
 
 ### Background processes
 
-Both running unattended in `screen` sessions:
+No background processes currently running. All pipeline steps complete.
+
+### Resume commands (if re-ingest is needed)
 
 ```bash
-screen -S redmine-download   # pipeline/01_download.py
-screen -S redmine-ingest     # pipeline/03_ingest.py
-```
+# Re-anonymize (e.g. after Phase 10 openQA URL stripping — apply to fresh data)
+.venv/bin/python pipeline/02_anonymize.py
 
-Monitor:
-```bash
-tail -f logs/download.log
-tail -f logs/ingest.log | grep -v HTTP
-screen -ls
-```
+# Re-ingest after anonymization change
+screen -dmS redmine-ingest bash -c 'cd /home/balogh/Redmine-RAG && .venv/bin/python -u pipeline/03_ingest.py --reset 2>&1 | tee logs/ingest.log'
 
-### Resume commands (if processes die)
-
-```bash
-# Resume download
-screen -dmS redmine-download bash -c 'cd /home/balogh/Redmine-RAG && .venv/bin/python -u pipeline/01_download.py >> logs/download.log 2>&1'
-
-# Resume ingest (no --reset needed — upsert is safe)
-screen -dmS redmine-ingest bash -c 'cd /home/balogh/Redmine-RAG && .venv/bin/python -u pipeline/03_ingest.py 2>&1 | tee -a logs/ingest.log'
+# Incremental sync
+python pipeline/01_download.py --background --sync
 ```
 
 ---
 
-## Key design decisions made during this session
+## Key design decisions
 
 ### openqatests filter (`JOURNALS_ONLY_PROJECTS`)
 69% of openqatests issues are auto-generated failure tickets with no human
@@ -142,37 +150,39 @@ then `--sync` for all subsequent runs.
 
 ### Upsert instead of add
 `collection.upsert()` replaces `collection.add()` in `store.py`.
-Ingest is now fully resumable at any point without `--reset`.
+Ingest is fully resumable at any point without `--reset`.
 
 ### Crash-resistant journal loop
 Network errors in the journal re-fetch loop are caught per-issue.
 Progress is saved, the issue is skipped, and the loop continues.
 After 3 consecutive errors, a 30-second pause is inserted.
 
-### openQA URL stripping (TODO — not yet implemented)
-Strip `openqa.suse.de` and `openqa.opensuse.org` URLs from text before
-embedding. To be added to `core/anonymizer.py` as a new regex pattern.
+### openQA URL stripping
+`openqa.suse.de` and `openqa.opensuse.org` URLs are stripped from all
+free text before embedding (replaced with `[OPENQA-URL]`). Applied as
+the first pass in `scrub_pii()` before the hostname regex, so no
+hostname fragment from the URL leaks through.
 
-### Score threshold (TODO — not yet implemented)
-`store.query()` should return empty results + "no relevant issues found"
-message when all top-K scores exceed a minimum L2 distance threshold.
+### Score threshold
+`store.query()` accepts `score_threshold: float | None`. When set, if the
+best L2 distance exceeds the threshold the method returns an empty list.
+Configure via `SCORE_THRESHOLD` in `.env` (unset = disabled).
+Typical useful range for `nomic-embed-text`: `1.0`–`1.4`.
 
-### Project filter extraction (TODO — not yet implemented)
-`rag.extract_filters()` should also extract project names from natural
-language queries and apply as a `project_id` ChromaDB where= clause.
+### Project filter extraction
+`rag.extract_filters()` now extracts a third field `project` from natural
+language. A `_PROJECT_ALIASES` dict (22 entries) maps aliases like
+`"kernel"` → `"qe-kernel"`, `"containers"` → `"containers"`, etc.
+Validated project names are applied as `project_id` ChromaDB filters.
 
-### Stronger citation instruction (TODO — not yet implemented)
-System prompt should require `(Issue #ID)` after every claim.
+### Stronger citation requirement
+System prompt requires `(Issue #ID)` after every individual claim.
+Prohibits uncited statements. Does not permit use of outside knowledge.
 
-### Batch query mode (TODO — not yet implemented)
-`pipeline/04_query.py --queries-file questions.txt` for benchmarking.
-
-### Evaluation framework (TODO — not yet implemented)
-`tests/eval/questions.jsonl` with `{question, expected_issue_ids[]}`.
-A hit-rate script runs queries and reports top-K recall.
-
-### README (TODO — not yet written)
-Full documentation: setup → pipeline steps → all flags → troubleshooting.
+### Background download (`--background`)
+`pipeline/01_download.py --background` re-execs the script detached
+from the terminal using `subprocess.Popen(start_new_session=True)`,
+appending stdout+stderr to `logs/download.log`. No `screen` needed.
 
 ---
 
@@ -180,9 +190,9 @@ Full documentation: setup → pipeline steps → all flags → troubleshooting.
 
 | Stage | Time | Notes |
 |---|---|---|
-| Journal re-fetch | ~1s/issue | Network-bound at 0.5s rate limit |
-| Anonymize 18k issues | ~25s | CPU-bound, trivially fast |
-| Embed + ingest 40,509 chunks | ~4h | 2.8 chunks/s, CPU ceiling |
+| Journal re-fetch | ~0.5–1s/issue | Network-bound at 0.5s rate limit |
+| Anonymize 29k issues | ~28s | CPU-bound, trivially fast |
+| Embed + ingest 67,797 chunks | ~5h 52m | 3.2 chunks/s, CPU ceiling |
 | Filter extraction | ~5s | One llama3 chat call |
 | Retrieval | ~0.2s | ChromaDB vector search |
 | Answer generation | ~25–55s | llama3 on CPU, output-length dependent |
@@ -203,7 +213,7 @@ source .venv/bin/activate
 # Run all tests
 pytest tests/
 
-# Current result: 260 passed, 97% coverage
+# Current result: 279 passed, 97% coverage
 ```
 
 ### Ollama models available
@@ -231,14 +241,16 @@ JOURNALS_ONLY_PROJECTS=openqatests
 DEV_PROJECT_ID=qesecurity
 DEV_DATA_DIR=./data/dev
 DEV_COLLECTION_NAME=redmine_issues_dev
+# SCORE_THRESHOLD=          # unset — disabled by default
 ```
 
 ---
 
 ## Completed work
 
+### Phases 1–9
 - [x] Full pipeline redesign (Phases 1–8)
-- [x] 260 tests, 97% coverage
+- [x] 260 tests, 97% coverage (pre-Phase 10)
 - [x] Adaptive backoff in Redmine client
 - [x] PII scrubbing (emails, IPs, hostnames)
 - [x] Section-based chunking (5 journals/chunk)
@@ -254,16 +266,56 @@ DEV_COLLECTION_NAME=redmine_issues_dev
 - [x] openqatests journals-only filter
 - [x] First demo presented to QA engineers (success)
 - [x] DEMO.md — demo script with 6 prepared queries and Q&A
+- [x] Full download of all 9 projects (29,544 issues total)
+- [x] Full ingest of 67,797 chunks into ChromaDB (5h 52m)
 
-## Pending work (from design interview)
+### Phase 10 (completed 2026-05-30)
+- [x] Strip openQA URLs from text before embedding (`anonymizer.py`)
+- [x] Score threshold in `store.query()` (configurable via `SCORE_THRESHOLD`)
+- [x] Project name extraction in `rag.extract_filters()` (22 aliases)
+- [x] Stronger citation instruction in system prompt
+- [x] `--queries-file` batch mode in `04_query.py`
+- [x] `--background` flag in `01_download.py`
+- [x] `tests/eval/` evaluation framework (`questions.jsonl` + `hit_rate.py`)
+- [x] `README.md` — full documentation
+- [x] 279 tests, 97% coverage (21 new tests added in Phase 10)
 
-- [ ] Strip openQA URLs from text before embedding
-- [ ] Score threshold in `store.query()`
-- [ ] Project name extraction in `rag.extract_filters()`
-- [ ] Stronger citation instruction in system prompt
-- [ ] `--queries-file` batch mode in `04_query.py`
-- [ ] `--background` flag in `01_download.py`
-- [ ] `tests/eval/` evaluation framework
-- [ ] `README.md` — full documentation
-- [ ] Complete download (openqa-infrastructure + containers still pending)
-- [ ] Complete ingest (40,509 chunks, ~34% done)
+### Phase 11 (completed 2026-05-30)
+- [x] `app.py` — Flask web interface (`/`, `/status`, `/eta`)
+- [x] `templates/index.html` — Jinja2 template with form, answer, source cards
+- [x] `Flask>=3.0` and `markdown2>=2.5` added to `requirements.txt`
+- [x] Verified: starts cleanly, loads 67,797 docs, serves HTML (HTTP 200)
+- [x] `SESSION.md`, `PLAN.md`, `README.md` updated
+
+---
+
+## Web interface (app.py)
+
+Flask web frontend added in Phase 11. Mirrors the Bugzilla RAG project style.
+
+```bash
+python app.py                  # production, port 5000
+python app.py --dev            # dev collection
+python app.py --no-filter      # skip filter extraction
+python app.py --port 8080
+```
+
+Open `http://localhost:5000/` in a browser.
+
+Routes: `GET /` (form), `POST /` (query), `GET /status`, `GET /eta`
+
+---
+
+## Pending work (Phase 12 candidates)
+
+- [ ] Re-run `02_anonymize.py` + `03_ingest.py --reset` to apply openQA URL
+      stripping to the current dataset (anonymized before Phase 10 landed)
+- [ ] Populate `tests/eval/questions.jsonl` with `expected_ids` by running
+      queries and verifying results, to get meaningful hit rate @K metrics
+- [ ] Tune `SCORE_THRESHOLD` using `hit_rate.py` to find the optimal value
+- [ ] Streaming output via `ollama.chat(stream=True)` — pipe tokens to browser
+      with Server-Sent Events so the answer appears word-by-word instead of
+      after ~40s silence
+- [ ] Conversation memory: add last-N-turns context for follow-up questions
+- [ ] Production WSGI server: replace Flask dev server with `gunicorn` for
+      multi-worker concurrent queries

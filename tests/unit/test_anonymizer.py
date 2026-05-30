@@ -224,3 +224,47 @@ class TestScrubPii:
         # The IP regex is word-boundary anchored so embedded versions may or
         # may not match — just verify the function does not crash.
         assert isinstance(result, str)
+
+    def test_openqa_suse_de_url_redacted(self):
+        """Full openqa.suse.de URLs are replaced with [OPENQA-URL]."""
+        text = "See test run at https://openqa.suse.de/tests/12345678 for details."
+        result = scrub_pii(text)
+        assert "openqa.suse.de" not in result
+        assert "[OPENQA-URL]" in result
+
+    def test_openqa_opensuse_org_url_redacted(self):
+        """Full openqa.opensuse.org URLs are replaced with [OPENQA-URL]."""
+        text = "Failed at http://openqa.opensuse.org/tests/99999#step/boot/1"
+        result = scrub_pii(text)
+        assert "openqa.opensuse.org" not in result
+        assert "[OPENQA-URL]" in result
+
+    def test_openqa_url_with_query_string_redacted(self):
+        """openQA URLs with query parameters are fully stripped."""
+        text = "Results: https://openqa.suse.de/tests/overview?distri=sle&version=15-SP5"
+        result = scrub_pii(text)
+        assert "openqa.suse.de" not in result
+        assert "[OPENQA-URL]" in result
+
+    def test_multiple_openqa_urls_all_redacted(self):
+        """Multiple openQA URLs in one text are all replaced."""
+        text = (
+            "Job1: https://openqa.suse.de/tests/111 "
+            "Job2: https://openqa.opensuse.org/tests/222"
+        )
+        result = scrub_pii(text)
+        assert result.count("[OPENQA-URL]") == 2
+
+    def test_non_openqa_url_preserved(self):
+        """URLs to unrelated external hosts are not affected by the openQA URL pattern."""
+        text = "See https://github.com/openSUSE/os-autoinst/issues/42 for details."
+        result = scrub_pii(text)
+        assert "github.com" in result
+
+    def test_openqa_url_scrubbed_before_hostname_pattern(self):
+        """openQA URL stripping runs before hostname redaction so no double-replace."""
+        text = "Run: https://openqa.suse.de/tests/42"
+        result = scrub_pii(text)
+        assert "[OPENQA-URL]" in result
+        # Should not also contain [REDACTED-HOST] from the same URL
+        assert result.count("[REDACTED-HOST]") == 0
